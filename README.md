@@ -1,7 +1,53 @@
-# Tauri + SvelteKit + TypeScript
+# 📋 Clipboard Manager (剪贴板 & 密码本神器)
 
-This template should help get you started developing with Tauri, SvelteKit and TypeScript in Vite.
+搞了个桌面端的小工具，平时复制粘贴东西、记点账号密码啥的挺方便的。主打一个轻量、好看、随叫随到。
 
-## Recommended IDE Setup
+受够了那些动辄占用几百 MB 内存的臃肿软件。UI 干净利落，后台安静潜伏，绝对是日常搬砖的效率好帮手。
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+## ✨ 核心功能能干啥？
+
+* 🚀 **随叫随到 (全局快捷键)**
+  不管你在干嘛，按下 `Alt + C`（或你设置的快捷键），窗口瞬间弹到脸上。用完再按一次直接隐藏，绝不碍事。
+* 📝 **剪贴板历史 (图文分流)**
+  自动记录你最近复制的文字和图片。不管你是网页右键复制，还是用截图工具截的图，甚至是直接 `Ctrl+C` 复制的本地图片文件，都能完美抓取。左边图片、右边文字，点一下图标直接重新塞进剪贴板。
+* 🔑 **随身密码本 (本地存储)**
+  脑子不好使经常忘密码？直接存在这个密码本里。支持一键复制账号或密码，密码默认小眼睛隐藏防偷窥。数据全都存在你电脑本地，不连什么乱七八糟的云端，主打一个安全踏实。
+* 👻 **安静潜伏 (系统托盘 & 开机自启)**
+  开机自己默默启动，平时就躲在右下角系统托盘里当个透明人。想彻底退出？右键托盘图标点 Quit 就行。
+
+## 🛠️ 怎么捣鼓出来的？
+
+用了目前桌面端极度舒适的技术栈，告别卡顿和内存焦虑：
+* **前端**: Svelte + Vite (无虚拟 DOM，快得飞起)
+
+* **后端**: Tauri + Rust (极速、极低内存占用、不吃电脑配置)
+
+* **剪贴板解析**: clipboard-rs (接管底层，什么姿势复制的图都能读出来)
+
+  ------
+
+  
+
+如果你想把代码拉下来自己跑或者二次开发，按下面步骤来就行：
+
+装好 `Node.js` 和 `Rust` 环境。
+
+- [ ] 依赖装一波：
+
+```bash
+npm install
+```
+
+- [ ] 跑个开发环境玩玩：
+
+```
+npm run tauri dev
+```
+
+- [ ] 打包成 `.exe` 直接用：
+
+```
+npm run tauri build
+```
+
+打包完的安装包在 `src-tauri/target/release/bundle/` 里面，直接双击安装，舒舒服服。
