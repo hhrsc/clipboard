@@ -3,399 +3,714 @@
   import { onMount } from 'svelte';
   import { fade, fly } from 'svelte/transition';
 
-  let searchQuery = "";
-  let history = []; // 存储完整的历史记录
-  let lastData = "";
+  let activeTab = 'clipboard'; 
   let showToast = false;
+  let toastMsg = "Copied!";
 
-  // 辅助函数：保存到本地存储
+  let searchQuery = "";
+  let history = []; 
+  let lastData = "";
+
+  let pwdSearchQuery = "";
+  let passwords = [];
+  let newPwdTitle = "";
+  let newPwdUser = "";
+  let newPwdPass = "";
+
   function saveHistory() {
     localStorage.setItem('clip_v4_split', JSON.stringify(history));
+    localStorage.setItem('clip_v4_last_data', lastData);
+  }
+
+  function savePasswords() {
+    localStorage.setItem('clip_v4_passwords', JSON.stringify(passwords));
   }
 
   onMount(() => {
-    // 启动时读取本地存储
     const saved = localStorage.getItem('clip_v4_split');
-    if (saved) {
-      try { history = JSON.parse(saved); } catch (e) { history = []; }
-    }
+    if (saved) { try { history = JSON.parse(saved); } catch (e) { history = []; } }
+    const savedLastData = localStorage.getItem('clip_v4_last_data');
+    if (savedLastData) lastData = savedLastData;
 
-    // 定时监听剪贴板
-    setInterval(async () => {
+    const savedPwds = localStorage.getItem('clip_v4_passwords');
+    if (savedPwds) { try { passwords = JSON.parse(savedPwds); } catch (e) { passwords = []; } }
+
+    const clipboardInterval = setInterval(async () => {
       try {
         const data = await invoke('get_clipboard_data');
         if (data) {
           const [type, content] = data;
-          // 如果内容与上次不同，则添加新记录
           if (content !== lastData) {
-            // 添加一个 timestamp 字段用于界面显示
             const newItem = { type, content, id: Date.now(), timestamp: new Date().toLocaleString() };
-            // 新记录插到最前面，保留最近 60 条
             history = [newItem, ...history].slice(0, 60);
             lastData = content;
             saveHistory();
           }
         }
-      } catch (error) {
-        console.error("监听出错:", error);
-      }
+      } catch (error) { }
     }, 1000);
+
+    const handlePaste = async (e) => {
+      if (document.activeElement.tagName === 'INPUT') return;
+
+      const items = e.clipboardData.items;
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf('image') !== -1) {
+          const blob = items[i].getAsFile();
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const base64 = event.target.result.split(',')[1];
+            const content = `image|${base64}`;
+            if (content !== lastData) {
+              const newItem = { type: 'image', content, id: Date.now(), timestamp: new Date().toLocaleString() };
+              history = [newItem, ...history].slice(0, 60);
+              lastData = content;
+              saveHistory();
+              triggerToast("Image Pasted!");
+            }
+          };
+          reader.readAsDataURL(blob);
+        } else if (items[i].type === 'text/plain') {
+          items[i].getAsString((text) => {
+            if (text !== lastData) {
+              const newItem = { type: 'text', content: text, id: Date.now(), timestamp: new Date().toLocaleString() };
+              history = [newItem, ...history].slice(0, 60);
+              lastData = text;
+              saveHistory();
+              triggerToast("Text Pasted!");
+            }
+          });
+        }
+      }
+    };
+
+    window.addEventListener('paste', handlePaste);
+
+    return () => {
+      clearInterval(clipboardInterval);
+      window.removeEventListener('paste', handlePaste);
+    };
   });
 
-  // --- 交互功能 ---
-
-  // 触发复制成功弹窗
-  function triggerToast() {
+  function triggerToast(msg = "Copied!") {
+    toastMsg = msg;
     showToast = true;
     setTimeout(() => { showToast = false; }, 800);
   }
 
-  // 点击文本卡片进行复制
   async function copyText(text) {
+    if (!text) return;
     await invoke('set_clipboard_text', { text });
     lastData = text;
+    saveHistory();
     triggerToast();
   }
 
-  // 点击图片卡片（暂时只提示）
-  function handleImageClick() {
-    alert("图片暂不支持直接点击复制，请在原始位置右键复制。");
-  }
-
-  // 删除单个条目
-  function deleteItem(id) {
-    history = history.filter(item => item.id !== id);
-    saveHistory();
-  }
-
-  // --- 新增：独立清空功能 ---
-
-  // 清空所有图片
-  function clearImages() {
-    if (history.some(i => i.type !== 'text') && confirm("确定要清空所有图片记录吗？")) {
-      history = history.filter(item => item.type === 'text');
-      saveHistory();
-    }
-  }
-
-  // 清空所有文本
-  function clearText() {
-    if (history.some(i => i.type === 'text') && confirm("确定要清空所有文本记录吗？")) {
-      history = history.filter(item => item.type !== 'text');
-      saveHistory();
-    }
-  }
-
-  // 辅助函数：解析 Base64 图片
-  function getImgSrc(content) {
+  async function copyImage(content) {
+    if (!content) return;
     try {
-        const base64 = content.split('|')[1];
-        return `data:image/png;base64,${base64}`;
-    } catch (e) { return ''; }
+      const base64 = content.includes('|') ? content.split('|')[1] : content;
+      await invoke('set_clipboard_image', { base64 });
+      lastData = content;
+      saveHistory();
+      triggerToast("Image Copied!");
+    } catch (e) {
+      triggerToast("Failed to copy");
+    }
   }
 
-  // 辅助函数：格式化简短时间 (模拟图中的格式)
-  function formatTime(timestampStr) {
-      const date = new Date(timestampStr);
-      const month = (date.getMonth() + 1).toString().padStart(2, '0');
-      const day = date.getDate().toString().padStart(2, '0');
-      const hours = date.getHours().toString().padStart(2, '0');
-      const minutes = date.getMinutes().toString().padStart(2, '0');
-      return `${month}-${day} ${hours}:${minutes}`;
+  async function deleteItem(id) {
+    const item = history.find(i => i.id === id);
+    history = history.filter(i => i.id !== id);
+    saveHistory();
+    
+    if (item && item.content === lastData) {
+      await invoke('set_clipboard_text', { text: "" });
+      lastData = "";
+      localStorage.setItem('clip_v4_last_data', "");
+    }
   }
 
-  // --- 数据响应式过滤 ---
+  async function clearImages() {
+    const hasLastData = history.some(i => i.type !== 'text' && i.content === lastData);
+    history = history.filter(item => item.type === 'text');
+    saveHistory();
+    
+    if (hasLastData) {
+      await invoke('set_clipboard_text', { text: "" });
+      lastData = "";
+      localStorage.setItem('clip_v4_last_data', "");
+    }
+  }
 
-  // 图片列表通常不参与文本搜索，显示所有图片
+  async function clearText() {
+    const hasLastData = history.some(i => i.type === 'text' && i.content === lastData);
+    history = history.filter(item => item.type !== 'text');
+    saveHistory();
+    
+    if (hasLastData) {
+      await invoke('set_clipboard_text', { text: "" });
+      lastData = "";
+      localStorage.setItem('clip_v4_last_data', "");
+    }
+  }
+  
+  function addPassword() {
+    if (!newPwdTitle || !newPwdPass) return;
+    const newItem = { id: Date.now(), title: newPwdTitle, username: newPwdUser, password: newPwdPass, showPass: false };
+    passwords = [newItem, ...passwords];
+    savePasswords();
+    newPwdTitle = ""; newPwdUser = ""; newPwdPass = "";
+    triggerToast();
+  }
+
+  function deletePassword(id) {
+    passwords = passwords.filter(p => p.id !== id);
+    savePasswords();
+  }
+
+  function clearAllPasswords() {
+    passwords = [];
+    savePasswords();
+  }
+
+  function togglePassword(id) {
+    passwords = passwords.map(p => {
+      if (p.id === id) {
+        return { ...p, showPass: !p.showPass };
+      }
+      return p;
+    });
+  }
+
+  function getImgSrc(content) { try { return `data:image/png;base64,${content.split('|')[1]}`; } catch (e) { return ''; } }
+
   $: filteredImages = history.filter(item => item.type !== 'text');
-
-  // 文本列表参与搜索过滤
-  $: filteredText = searchQuery
-    ? history.filter(item => item.type === 'text' && item.content.toLowerCase().includes(searchQuery.toLowerCase()))
-    : history.filter(item => item.type === 'text');
-
+  $: filteredText = searchQuery ? history.filter(item => item.type === 'text' && item.content.toLowerCase().includes(searchQuery.toLowerCase())) : history.filter(item => item.type === 'text');
+  $: filteredPasswords = pwdSearchQuery ? passwords.filter(p => p.title.toLowerCase().includes(pwdSearchQuery.toLowerCase())) : passwords;
 </script>
 
 <main class="app-container">
-  <div class="search-bar-wrapper">
-    <div class="search-bar">
-      <svg class="search-icon" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-      <input type="text" placeholder="Search clipboard..." bind:value={searchQuery} />
+  <div class="header-nav">
+    <div class="tabs">
+      <button class={activeTab === 'clipboard' ? 'active' : ''} on:click={() => activeTab = 'clipboard'}>Clipboard</button>
+      <button class={activeTab === 'passwords' ? 'active' : ''} on:click={() => activeTab = 'passwords'}>Password Book</button>
     </div>
   </div>
 
-  <div class="content-split-view">
-
-    <div class="column image-column">
-      <div class="column-header">
-        <h2>IMAGES</h2>
-        <button class="clear-btn" on:click={clearImages}>Clear All</button>
-      </div>
-      <div class="scroll-area image-grid">
-        {#each filteredImages as item (item.id)}
-          <div class="image-card" on:click={handleImageClick} in:fly={{ y: 10, duration: 200 }}>
-            <img src={getImgSrc(item.content)} alt="clip" loading="lazy" />
-            <button class="delete-btn-overlay" on:click|stopPropagation={() => deleteItem(item.id)}>
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-            </button>
-            <div class="timestamp-overlay">{formatTime(item.timestamp)}</div>
-          </div>
-        {/each}
-      </div>
+  <div class="search-section">
+    <div class="search-box">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      {#if activeTab === 'clipboard'}
+        <input type="text" placeholder="Search stored clipboard..." bind:value={searchQuery} />
+      {:else}
+        <input type="text" placeholder="Search stored passwords..." bind:value={pwdSearchQuery} />
+      {/if}
     </div>
+  </div>
 
-    <div class="column text-column">
-      <div class="column-header">
-        <h2>TEXT</h2>
-        <button class="clear-btn" on:click={clearText}>Clear All</button>
-      </div>
-      <div class="scroll-area text-list">
-        {#each filteredText as item (item.id)}
-          <div class="text-card" on:click={() => copyText(item.content)} in:fly={{ x: 10, duration: 200 }}>
-            <p class="text-content">{item.content}</p>
-             <button class="delete-btn-inline" on:click|stopPropagation={() => deleteItem(item.id)}>
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#8E8E93" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-            </button>
+  <div class="content-area">
+    {#if activeTab === 'clipboard'}
+      <div class="clipboard-layout" in:fade>
+        <div class="left-pane">
+          <div class="pane-header">
+            <div class="pane-title">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+              Image History
+            </div>
+            <button class="btn-secondary" on:click={clearImages}>Clear All</button>
           </div>
-        {/each}
-      </div>
-    </div>
+          <div class="scroll-v image-grid">
+            {#each filteredImages as item (item.id)}
+              <div class="image-card" on:click={() => copyImage(item.content)} in:fly={{ y: 10 }}>
+                <img src={getImgSrc(item.content)} alt="" />
+                <button class="img-del" on:click|stopPropagation={() => deleteItem(item.id)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+              </div>
+            {/each}
+          </div>
+        </div>
 
+        <div class="divider"></div>
+
+        <div class="right-pane">
+          <div class="pane-header">
+            <div class="pane-title">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="12" y2="18"/></svg>
+              Text History
+            </div>
+            <button class="btn-secondary" on:click={clearText}>Clear All</button>
+          </div>
+          <div class="scroll-v list-container">
+            {#each filteredText as item (item.id)}
+              <div class="data-card pwd-card" on:click={() => copyText(item.content)} in:fly={{ x: 10 }}>
+                <div class="pwd-info text-info">
+                  <div class="pwd-title text-ellipsis">{item.content}</div>
+                  <div class="pwd-detail">
+                    <span class="detail-label">Text Clip</span>
+                  </div>
+                </div>
+                <div class="pwd-actions">
+                  <button class="action-icon" on:click|stopPropagation={() => copyText(item.content)}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </button>
+                  <button class="action-icon" on:click|stopPropagation={() => deleteItem(item.id)}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                  </button>
+                </div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      </div>
+    {:else}
+      <div class="password-layout" in:fade>
+        <div class="left-pane">
+          <div class="pane-title">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            Add New
+          </div>
+          <div class="input-group">
+            <div class="input-wrapper">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+              <input bind:value={newPwdTitle} placeholder="Gmail" />
+            </div>
+            <div class="input-wrapper">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+              <input bind:value={newPwdUser} placeholder="Username" />
+            </div>
+            <div class="input-wrapper">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+              <input bind:value={newPwdPass} placeholder="Password" type="password" />
+            </div>
+            <button class="btn-primary" on:click={addPassword}>Save</button>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="right-pane">
+          <div class="pane-header">
+            <div class="pane-title">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+              My Passwords
+            </div>
+            <button class="btn-secondary" on:click={clearAllPasswords}>Clear All</button>
+          </div>
+          <div class="scroll-v list-container">
+            {#each filteredPasswords as item (item.id)}
+              <div class="data-card pwd-card">
+                <div class="pwd-info">
+                  <div class="pwd-title">{item.title}</div>
+                  <div class="pwd-detail">
+                    {#if item.username}
+                      <span class="detail-label">Username</span>
+                      <span class="detail-value">{item.username}</span>
+                    {:else}
+                      <span class="detail-label">Password</span>
+                      <span class="detail-value">{item.showPass ? item.password : '********'}</span>
+                    {/if}
+                  </div>
+                </div>
+                <div class="pwd-actions">
+                  <button class="action-icon" on:click={() => togglePassword(item.id)}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                  </button>
+                  <button class="action-icon" on:click={() => copyText(item.password)}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </button>
+                  <button class="action-icon" on:click={() => deletePassword(item.id)}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                  </button>
+                </div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      </div>
+    {/if}
   </div>
 
   {#if showToast}
-    <div class="toast-container" transition:fade={{ duration: 150 }}>
-      <div class="toast">
-        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4CD964" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-        <span>Copied!</span>
-      </div>
-    </div>
+    <div class="toast-tip" transition:fade>{toastMsg}</div>
   {/if}
 </main>
 
 <style>
-  /* 全局样式重置与主题定义 */
   :global(body) {
     margin: 0;
-    /* 深色背景渐变 */
-    background: linear-gradient(135deg, #0a0f1d 0%, #060912 100%);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    color: #ffffff;
-    overflow: hidden; /* 禁止 body 滚动 */
+    background: #ffffff;
+    color: #1a1a1a;
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    overflow: hidden;
+    height: 100vh;
   }
 
-  /* 主容器 */
   .app-container {
+    width: 100%;
+    height: 100%;
     display: flex;
     flex-direction: column;
-    height: 100vh; /* 占满全屏高度 */
-    padding: 20px;
     box-sizing: border-box;
-    /* 给整个应用加一个微妙的蓝色光晕背景 */
-    background: radial-gradient(circle at 50% -20%, rgba(0, 122, 255, 0.15), transparent 70%);
+    padding: 10px 20px 20px;
   }
 
-  /* --- 顶部搜索栏 --- */
-  .search-bar-wrapper {
-    margin-bottom: 20px;
+  .header-nav {
+    padding: 0 0 10px 0;
+    border-bottom: 1px solid #f1f5f9;
   }
-  .search-bar {
+
+  .tabs {
+    display: flex;
+    gap: 20px;
+  }
+
+  .tabs button {
+    background: none;
+    border: none;
+    color: #64748b;
+    padding: 10px 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    border-bottom: 3px solid transparent;
+    transition: all 0.2s;
+  }
+
+  .tabs button.active {
+    color: #0f172a;
+    border-bottom: 3px solid #7cb3f2;
+    font-weight: 600;
+  }
+
+  .search-section {
+    padding: 15px 0;
+  }
+
+  .search-box {
     display: flex;
     align-items: center;
-    background: rgba(255, 255, 255, 0.08); /* 半透明背景 */
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 12px;
-    padding: 10px 16px;
-    backdrop-filter: blur(10px); /* 毛玻璃效果 */
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 8px 12px;
   }
-  .search-icon {
-    color: #8E8E93;
-    margin-right: 10px;
+
+  .search-box .icon {
+    width: 16px;
+    height: 16px;
+    color: #94a3b8;
   }
-  .search-bar input {
+
+  .search-box input {
     flex: 1;
-    background: transparent;
+    background: none;
     border: none;
-    color: #fff;
-    font-size: 16px;
     outline: none;
-  }
-  .search-bar input::placeholder {
-    color: #8E8E93;
+    margin-left: 10px;
+    font-size: 13px;
+    color: #334155;
   }
 
-  /* --- 主体内容双栏结构 --- */
-  .content-split-view {
-    flex: 1; /* 占据剩余高度 */
+  .content-area {
+    flex: 1;
+    overflow: hidden;
     display: flex;
-    gap: 25px; /* 两栏之间的间距 */
-    overflow: hidden; /* 防止自身滚动 */
   }
 
-  /* 通用栏目样式 */
-  .column {
-    flex: 1; /* 两栏平分宽度 */
+  .clipboard-layout, .password-layout {
+    display: flex;
+    width: 100%;
+    gap: 25px;
+  }
+
+  .left-pane {
+    width: 240px;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
-    /* 给栏目加一个深色半透明背景框 */
-    background: rgba(20, 25, 40, 0.6);
-    border-radius: 16px;
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    padding: 16px;
   }
 
-  /* 栏目头部 (标题 + Clear All 按钮) */
-  .column-header {
+  .right-pane {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .divider {
+    width: 1px;
+    background: #f1f5f9;
+  }
+
+  .pane-title {
+    font-size: 15px;
+    font-weight: 500;
+    color: #0f172a;
+    margin-bottom: 15px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .pane-title .icon {
+    width: 18px;
+    height: 18px;
+    color: #334155;
+  }
+
+  .pane-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 16px;
+    margin-bottom: 15px;
   }
-  .column-header h2 {
-    margin: 0;
-    font-size: 18px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    color: #EBEBF5;
+
+  .pane-header .pane-title {
+    margin-bottom: 0;
   }
-  .clear-btn {
-    background: rgba(255, 255, 255, 0.1);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    color: #EBEBF5;
-    padding: 6px 12px;
-    border-radius: 8px;
+
+  .input-group {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .input-wrapper {
+    display: flex;
+    align-items: center;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 8px 12px;
+    background: #ffffff;
+  }
+
+  .input-wrapper .icon {
+    width: 16px;
+    height: 16px;
+    color: #64748b;
+    margin-right: 10px;
+  }
+
+  .input-wrapper input {
+    flex: 1;
+    border: none;
+    outline: none;
     font-size: 13px;
+    color: #334155;
+    background: none;
+  }
+
+  .btn-primary {
+    background: #2b74ba;
+    color: white;
+    border: none;
+    padding: 10px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    margin-top: 5px;
+    transition: background 0.2s;
+  }
+
+  .btn-primary:hover {
+    background: #1d4ed8;
+  }
+
+  .btn-secondary {
+    background: #e0f2fe;
+    color: #0284c7;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
     cursor: pointer;
     transition: all 0.2s;
   }
-  .clear-btn:hover {
-    background: rgba(255, 255, 255, 0.2);
+
+  .btn-secondary:hover {
+    background: #bae6fd;
   }
 
-  /* 滚动区域容器 */
-  .scroll-area {
+  .scroll-v {
     flex: 1;
-    overflow-y: auto; /* 允许内部滚动 */
-    /* 自定义滚动条样式 (Chrome/Safari) */
-    &::-webkit-scrollbar { width: 6px; }
-    &::-webkit-scrollbar-track { background: transparent; }
-    &::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+    overflow-y: auto;
+    padding-right: 8px;
   }
 
-  /* --- 左侧：图片宫格样式 --- */
-  .image-grid {
-    display: grid;
-    /* 自动适应列数，最小宽度 130px */
-    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-    gap: 12px;
-    padding-right: 4px; /* 留点空隙给滚动条 */
-  }
-  .image-card {
-    position: relative;
-    aspect-ratio: 16 / 10; /* 固定宽高比 */
-    border-radius: 12px;
-    overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    cursor: default;
-    transition: transform 0.2s;
-  }
-  .image-card:hover {
-    transform: scale(1.02);
-    border-color: rgba(0, 122, 255, 0.5);
-  }
-  .image-card img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover; /* 填满容器，保持比例 */
-  }
-  /* 图片卡片上的浮层按钮和文字 */
-  .delete-btn-overlay {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    background: rgba(0, 0, 0, 0.5);
-    border: none;
-    width: 24px; height: 24px;
-    border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
-    color: white;
-    cursor: pointer;
-    opacity: 0.7; transition: opacity 0.2s;
-  }
-  .delete-btn-overlay:hover { opacity: 1; background: rgba(255, 59, 48, 0.8); }
-  .timestamp-overlay {
-    position: absolute;
-    bottom: 0; left: 0; right: 0;
-    padding: 4px 8px;
-    background: linear-gradient(to top, rgba(0,0,0,0.7), transparent);
-    color: rgba(255, 255, 255, 0.8);
-    font-size: 11px;
-    text-align: left;
-  }
+  .scroll-v::-webkit-scrollbar { width: 4px; }
+  .scroll-v::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
 
-  /* --- 右侧：文本列表样式 --- */
-  .text-list {
+  .list-container {
     display: flex;
     flex-direction: column;
     gap: 10px;
-    padding-right: 4px;
   }
-  .text-card {
+
+  .data-card {
+    background: #ffffff;
+    border: 1px solid #7cb3f2;
+    border-radius: 12px;
+    padding: 12px 16px;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: rgba(44, 44, 46, 0.6); /* 深灰色卡片背景 */
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    padding: 14px 16px;
-    border-radius: 12px;
-    cursor: pointer;
     transition: all 0.2s;
+    cursor: pointer;
   }
-  .text-card:hover {
-    background: rgba(58, 58, 60, 0.8);
-    border-color: rgba(0, 122, 255, 0.3);
+
+  .data-card:hover {
+    background: #f8fafc;
   }
-  .text-card:active {
-      transform: scale(0.99);
+
+  .pwd-card {
+    padding: 10px 16px;
+    cursor: default;
   }
-  .text-content {
-    margin: 0;
-    font-size: 15px;
-    color: #EBEBF5;
-    /* 单行显示，超出省略 */
+
+  .pwd-card:hover {
+    background: #ffffff;
+  }
+
+  .pwd-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 0; 
+  }
+
+  .text-info {
+    margin-right: 10px;
+  }
+
+  .pwd-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: #0f172a;
+  }
+
+  .text-ellipsis {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    flex: 1; /* 占据剩余空间 */
-    margin-right: 12px;
-  }
-  .delete-btn-inline {
-    background: transparent;
-    border: none;
-    padding: 4px;
-    display: flex; align-items: center; justify-content: center;
-    cursor: pointer;
-    border-radius: 4px;
-    transition: background 0.2s;
-  }
-  .delete-btn-inline:hover svg {
-    stroke: #FF3B30; /* hover 时变红 */
+    width: 100%;
   }
 
-  /* --- 复制成功提示弹窗 (保持不变) --- */
-  .toast-container {
-    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-    display: flex; align-items: center; justify-content: center;
-    pointer-events: none; z-index: 999;
+  .pwd-detail {
+    font-size: 12px;
+    color: #64748b;
+    display: flex;
+    gap: 6px;
   }
-  .toast {
-    background: rgba(0, 0, 0, 0.85); color: white;
-    padding: 12px 24px; border-radius: 50px;
-    display: flex; align-items: center; gap: 8px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-    backdrop-filter: blur(10px);
-    border: 1px solid rgba(255,255,255,0.1);
-    font-weight: 600;
+
+  .detail-label {
+    color: #94a3b8;
+  }
+
+  .detail-value {
+    letter-spacing: 0.5px;
+  }
+
+  .pwd-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-shrink: 0; 
+  }
+
+  .action-icon {
+    background: none;
+    border: none;
+    color: #64748b;
+    cursor: pointer;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: all 0.2s;
+    padding: 0;
+    flex-shrink: 0;
+  }
+
+  .action-icon:hover {
+    color: #0f172a;
+    background: #f1f5f9;
+  }
+
+  .action-icon svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .image-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+
+  .image-card {
+    position: relative;
+    border: 1px solid #7cb3f2;
+    border-radius: 8px;
+    overflow: hidden;
+    aspect-ratio: 1;
+    cursor: pointer;
+  }
+
+  .image-card:hover {
+    border-color: #2b74ba;
+  }
+
+  .image-card img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .img-del {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: rgba(255,255,255,0.9);
+    border: none;
+    border-radius: 4px;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    color: #64748b;
+  }
+
+  .img-del svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  .img-del:hover {
+    background: #fee2e2;
+    color: #ef4444;
+  }
+
+  .toast-tip {
+    position: fixed;
+    top: 30px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1e293b;
+    color: white;
+    padding: 10px 24px;
+    border-radius: 30px;
+    font-size: 13px;
+    font-weight: 500;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    z-index: 100;
   }
 </style>

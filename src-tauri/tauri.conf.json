@@ -11,13 +11,16 @@
   },
   "app": {
     "windows": [
-      {
-        "title": "我的剪贴板",
-        "width": 400,
-        "height": 600,
-        "resizable": true
-      }
-    ],
+  {
+    "title": "Clipboard Manager",
+    "width": 680,
+    "height": 620,
+    "decorations": true,
+    "transparent": false,
+    "resizable": true,
+    "fullscreen": false
+  }
+],
     "security": {
       "csp": null
     }
