@@ -18,7 +18,6 @@
   let newPwdPass = "";
   
   let showNewPwd = false;
-
   let isAppCopying = false; 
 
   let categories = ['全部']; 
@@ -34,7 +33,31 @@
   let isRenamingCat = false;
   let renameCatName = "";
 
-  function saveHistory() {
+  // 历史记录策略：未分类24小时过期/限50条，已分类永久/无上限，图片限10张
+  function updateAndSaveHistory(newArray) {
+    const EXPIRATION_MS = 24 * 60 * 60 * 1000; 
+    const now = Date.now();
+
+    let valid = newArray.filter(item => {
+      if (item.type === 'text' && (!item.category || item.category === '全部')) {
+        return (now - item.id) < EXPIRATION_MS;
+      }
+      return true;
+    });
+
+    const imgs = valid.filter(i => i.type !== 'text');
+    const catTexts = valid.filter(i => i.type === 'text' && i.category && i.category !== '全部');
+    const uncatTexts = valid.filter(i => i.type === 'text' && (!i.category || i.category === '全部'));
+
+    let merged = [
+      ...imgs.slice(0, 10),
+      ...catTexts, 
+      ...uncatTexts.slice(0, 50)
+    ];
+
+    merged.sort((a, b) => b.id - a.id);
+
+    history = merged;
     localStorage.setItem('clip_v5_split', JSON.stringify(history));
     localStorage.setItem('clip_v5_last_data', lastData);
   }
@@ -59,34 +82,34 @@
     const savedCats = localStorage.getItem('clip_v5_categories');
     if (savedCats) { try { categories = JSON.parse(savedCats); } catch (e) { categories = ['全部']; } }
 
+    // 初始化清理过期数据
+    updateAndSaveHistory(history);
+
     const clipboardInterval = setInterval(async () => {
+      // 轮询清理过期未分类文本
+      const now = Date.now();
+      const EXPIRATION_MS = 24 * 60 * 60 * 1000;
+      if (history.some(i => i.type === 'text' && (!i.category || i.category === '全部') && (now - i.id) > EXPIRATION_MS)) {
+        updateAndSaveHistory(history);
+      }
+
       try {
         const data = await invoke('get_clipboard_data');
         if (data) {
           const [type, content] = data;
           if (content !== lastData) {
-            
             if (isAppCopying && type === 'image') {
               lastData = content; 
               isAppCopying = false; 
-              saveHistory();
+              updateAndSaveHistory(history);
               return; 
             }
 
             const defaultCat = (type === 'text' && activeCategory !== '全部') ? activeCategory : '全部';
             const newItem = { type, content, id: Date.now(), timestamp: new Date().toLocaleString(), category: defaultCat };
             
-            const images = history.filter(i => i.type !== 'text');
-            const texts = history.filter(i => i.type === 'text');
-            if (type === 'image') {
-              images.unshift(newItem);
-            } else {
-              texts.unshift(newItem);
-            }
-            history = [...images.slice(0, 10), ...texts.slice(0, 50)];
-            
             lastData = content;
-            saveHistory();
+            updateAndSaveHistory([newItem, ...history]);
           }
         }
       } catch (error) { }
@@ -105,12 +128,8 @@
             const content = `image|${base64}`;
             if (content !== lastData) {
               const newItem = { type: 'image', content, id: Date.now(), timestamp: new Date().toLocaleString() };
-              const images = history.filter(item => item.type !== 'text');
-              const texts = history.filter(item => item.type === 'text');
-              images.unshift(newItem);
-              history = [...images.slice(0, 10), ...texts.slice(0, 50)];
               lastData = content;
-              saveHistory();
+              updateAndSaveHistory([newItem, ...history]);
               triggerToast("Image Pasted!");
             }
           };
@@ -120,12 +139,8 @@
             if (text !== lastData) {
               const defaultCat = activeCategory !== '全部' ? activeCategory : '全部';
               const newItem = { type: 'text', content: text, id: Date.now(), timestamp: new Date().toLocaleString(), category: defaultCat };
-              const images = history.filter(item => item.type !== 'text');
-              const texts = history.filter(item => item.type === 'text');
-              texts.unshift(newItem);
-              history = [...images.slice(0, 10), ...texts.slice(0, 50)];
               lastData = text;
-              saveHistory();
+              updateAndSaveHistory([newItem, ...history]);
               triggerToast("Text Pasted!");
             }
           });
@@ -151,7 +166,7 @@
     if (!text) return;
     await invoke('set_clipboard_text', { text });
     lastData = text;
-    saveHistory();
+    updateAndSaveHistory(history);
     triggerToast();
   }
 
@@ -170,38 +185,35 @@
 
   async function deleteItem(id) {
     const item = history.find(i => i.id === id);
-    history = history.filter(i => i.id !== id);
-    saveHistory();
+    let newHistory = history.filter(i => i.id !== id);
     if (item && item.content === lastData) {
       await invoke('set_clipboard_text', { text: "" });
       lastData = "";
-      localStorage.setItem('clip_v5_last_data', "");
     }
+    updateAndSaveHistory(newHistory);
   }
 
   async function clearImages() {
     const hasLastData = history.some(i => i.type !== 'text' && i.content === lastData);
-    history = history.filter(item => item.type === 'text');
-    saveHistory();
+    let newHistory = history.filter(item => item.type === 'text');
     if (hasLastData) {
       await invoke('set_clipboard_text', { text: "" });
       lastData = "";
-      localStorage.setItem('clip_v5_last_data', "");
     }
+    updateAndSaveHistory(newHistory);
   }
 
   async function clearText() {
     const toDelete = history.filter(item => item.type === 'text' && (activeCategory === '全部' || (item.category || '全部') === activeCategory));
     const hasLastData = toDelete.some(i => i.content === lastData);
     
-    history = history.filter(item => !toDelete.includes(item));
-    saveHistory();
+    let newHistory = history.filter(item => !toDelete.includes(item));
     
     if (hasLastData) {
       await invoke('set_clipboard_text', { text: "" });
       lastData = "";
-      localStorage.setItem('clip_v5_last_data', "");
     }
+    updateAndSaveHistory(newHistory);
   }
   
   function addCategory() {
@@ -214,8 +226,8 @@
   }
 
   function changeCategory(id, newCat) {
-    history = history.map(item => item.id === id ? { ...item, category: newCat } : item);
-    saveHistory();
+    let newHistory = history.map(item => item.id === id ? { ...item, category: newCat } : item);
+    updateAndSaveHistory(newHistory);
   }
 
   function handleContextMenu(e, cat) {
@@ -237,10 +249,10 @@
   function confirmRename() {
     if (renameCatName && renameCatName !== targetCategory && !categories.includes(renameCatName)) {
       categories = categories.map(c => c === targetCategory ? renameCatName : c);
-      history = history.map(item => item.category === targetCategory ? { ...item, category: renameCatName } : item);
+      let newHistory = history.map(item => item.category === targetCategory ? { ...item, category: renameCatName } : item);
       if (activeCategory === targetCategory) activeCategory = renameCatName;
       saveCategories();
-      saveHistory();
+      updateAndSaveHistory(newHistory);
     }
     isRenamingCat = false;
   }
@@ -248,10 +260,10 @@
   function deleteCategoryFromMenu() {
     const cat = targetCategory;
     categories = categories.filter(c => c !== cat);
-    history = history.map(item => item.category === cat ? { ...item, category: '全部' } : item);
-    saveHistory();
+    let newHistory = history.map(item => item.category === cat ? { ...item, category: '全部' } : item);
     saveCategories();
     if (activeCategory === cat) activeCategory = '全部';
+    updateAndSaveHistory(newHistory);
     closeContextMenu();
   }
 
@@ -314,9 +326,9 @@
           </div>
           <div class="scroll-v image-grid">
             {#each filteredImages as item (item.id)}
-              <div class="image-card" on:click={() => copyImage(item.content)} on:keydown={(e) => e.key === 'Enter' && copyImage(item.content)} tabindex="0" role="button" in:fly={{ y: 10 }}>
-                <img src={getImgSrc(item.content)} alt="Clipboard snapshot" />
-                <button class="img-del" on:click|stopPropagation={() => deleteItem(item.id)} aria-label="Delete image">
+              <div class="image-card" on:click={() => copyImage(item.content)} in:fly={{ y: 10 }}>
+                <img src={getImgSrc(item.content)} alt="" />
+                <button class="img-del" on:click|stopPropagation={() => deleteItem(item.id)}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                 </button>
               </div>
@@ -349,10 +361,7 @@
                   <div 
                     class="cat-tab {activeCategory === cat ? 'active' : ''}" 
                     on:click={() => activeCategory = cat}
-                    on:keydown={(e) => e.key === 'Enter' && (activeCategory = cat)}
-                    on:contextmenu|preventDefault={(e) => handleContextMenu(e, cat)}
-                    tabindex="0"
-                    role="tab">
+                    on:contextmenu|preventDefault={(e) => handleContextMenu(e, cat)}>
                     {cat}
                   </div>
                 {/if}
@@ -367,7 +376,7 @@
                   placeholder="新分类..."
                   autofocus />
               {:else}
-                <button class="add-cat-btn" on:click={() => isAddingCat = true} aria-label="Add category">
+                <button class="add-cat-btn" on:click={() => isAddingCat = true}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                 </button>
               {/if}
@@ -376,7 +385,7 @@
 
           <div class="scroll-v list-container" style="padding-top: 5px;">
             {#each displayedText as item (item.id)}
-              <div class="data-card pwd-card" on:click={() => copyText(item.content)} on:keydown={(e) => e.key === 'Enter' && copyText(item.content)} tabindex="0" role="button" in:fly={{ x: 10 }}>
+              <div class="data-card pwd-card" on:click={() => copyText(item.content)} in:fly={{ x: 10 }}>
                 <div class="pwd-info text-info">
                   <div class="pwd-title text-ellipsis">{item.content}</div>
                   <div class="pwd-detail">
@@ -388,10 +397,10 @@
                   </div>
                 </div>
                 <div class="pwd-actions">
-                  <button class="action-icon" on:click|stopPropagation={() => copyText(item.content)} aria-label="Copy text">
+                  <button class="action-icon" on:click|stopPropagation={() => copyText(item.content)}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                   </button>
-                  <button class="action-icon" on:click|stopPropagation={() => deleteItem(item.id)} aria-label="Delete text">
+                  <button class="action-icon" on:click|stopPropagation={() => deleteItem(item.id)}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                   </button>
                 </div>
@@ -417,7 +426,7 @@
               <input bind:value={newPwdUser} placeholder="Username" />
             </div>
             <div class="input-wrapper">
-              <button class="icon-btn" on:click={() => showNewPwd = !showNewPwd} aria-label={showNewPwd ? "Hide password" : "Show password"}>
+              <button class="icon-btn" on:click={() => showNewPwd = !showNewPwd}>
                 {#if showNewPwd}
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                 {:else}
@@ -443,10 +452,9 @@
           <div class="scroll-v list-container">
             {#each filteredPasswords as item (item.id)}
               <div class="data-card pass-card">
-                
                 <div class="pass-row pass-header">
                   <div class="pass-title">{item.title}</div>
-                  <button class="action-icon danger-icon" on:click={() => deletePassword(item.id)} aria-label="Delete password">
+                  <button class="action-icon danger-icon" on:click={() => deletePassword(item.id)}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                   </button>
                 </div>
@@ -457,7 +465,7 @@
                       <span class="detail-label">User:</span>
                       <span class="detail-value">{item.username}</span>
                     </div>
-                    <button class="action-icon" on:click={() => copyText(item.username)} aria-label="Copy username">
+                    <button class="action-icon" on:click={() => copyText(item.username)}>
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
                     </button>
                   </div>
@@ -469,19 +477,18 @@
                     <span class="detail-value">{item.showPass ? item.password : '****'}</span>
                   </div>
                   <div class="pass-actions">
-                    <button class="action-icon" on:click={() => togglePassword(item.id)} aria-label={item.showPass ? "Hide password" : "Show password"}>
+                    <button class="action-icon" on:click={() => togglePassword(item.id)}>
                       {#if item.showPass}
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
                       {:else}
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                       {/if}
                     </button>
-                    <button class="action-icon" on:click={() => copyText(item.password)} aria-label="Copy password">
+                    <button class="action-icon" on:click={() => copyText(item.password)}>
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                     </button>
                   </div>
                 </div>
-
               </div>
             {/each}
           </div>
@@ -596,7 +603,6 @@
   .data-card { background: #ffffff; border: 1px solid #7cb3f2; border-radius: 12px; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; transition: all 0.2s; cursor: pointer; }
   .data-card:hover { background: #f8fafc; }
 
-  /* 密码本卡片排版 */
   .pass-card { display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 12px 14px; cursor: default; }
   .pass-row { display: flex; justify-content: space-between; align-items: center; width: 100%; }
   .pass-header { padding-bottom: 8px; border-bottom: 1px solid #f1f5f9; margin-bottom: 2px; }
