@@ -1,12 +1,96 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat, RustImageData};
-use clipboard_rs::common::RustImage;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use clipboard_rs::common::RustImage;
+use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat, RustImageData};
 use std::path::Path;
-use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::Manager;
+
+const MAX_IMAGE_FILE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_IMAGE_DATA_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 8192;
+const MAX_IMAGE_PIXELS: u64 = 20_000_000;
+
+fn validate_image_dimensions(width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("image dimensions are invalid".to_string());
+    }
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return Err(format!(
+            "image dimensions exceed limit (max {}x{})",
+            MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION
+        ));
+    }
+    let pixel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| "image dimensions overflow".to_string())?;
+    if pixel_count > MAX_IMAGE_PIXELS {
+        return Err(format!(
+            "image pixel count exceeds limit (max {} pixels)",
+            MAX_IMAGE_PIXELS
+        ));
+    }
+    Ok(())
+}
+
+fn validate_image_file(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_IMAGE_FILE_BYTES {
+        return Err(format!(
+            "image file exceeds size limit (max {} bytes)",
+            MAX_IMAGE_FILE_BYTES
+        ));
+    }
+
+    let reader = image::ImageReader::open(path).map_err(|e| e.to_string())?;
+    let reader = reader.with_guessed_format().map_err(|e| e.to_string())?;
+    let (width, height) = reader.into_dimensions().map_err(|e| e.to_string())?;
+    validate_image_dimensions(width, height)
+}
+
+fn estimate_base64_decoded_len(base64: &str) -> Result<usize, String> {
+    if base64.is_empty() {
+        return Err("image payload is empty".to_string());
+    }
+    if base64.len() % 4 != 0 {
+        return Err("invalid base64 payload length".to_string());
+    }
+
+    let padding = base64
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'=')
+        .count();
+    let decoded_len = base64
+        .len()
+        .checked_div(4)
+        .and_then(|v| v.checked_mul(3))
+        .and_then(|v| v.checked_sub(padding))
+        .ok_or_else(|| "base64 payload is too large".to_string())?;
+
+    Ok(decoded_len)
+}
+
+fn validate_image_bytes(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Err("image payload is empty".to_string());
+    }
+    if bytes.len() > MAX_IMAGE_DATA_BYTES {
+        return Err(format!(
+            "image payload exceeds size limit (max {} bytes)",
+            MAX_IMAGE_DATA_BYTES
+        ));
+    }
+
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let (width, height) = reader.into_dimensions().map_err(|e| e.to_string())?;
+    validate_image_dimensions(width, height)
+}
 
 #[tauri::command]
 fn set_clipboard_text(text: String) -> Result<(), String> {
@@ -24,11 +108,19 @@ fn get_clipboard_data() -> Result<Option<(String, String)>, String> {
             if let Some(file_path) = files.first() {
                 let path = Path::new(file_path);
                 if path.is_file() {
-                    if let Ok(img) = image::open(path) {
-                        let mut buffer = std::io::Cursor::new(Vec::new());
-                        if img.write_to(&mut buffer, image::ImageFormat::Png).is_ok() {
-                            let base64_str = STANDARD.encode(buffer.into_inner());
-                            return Ok(Some(("image".to_string(), format!("image|{}", base64_str))));
+                    if validate_image_file(path).is_ok() {
+                        if let Ok(img) = image::open(path) {
+                            let mut buffer = std::io::Cursor::new(Vec::new());
+                            if img.write_to(&mut buffer, image::ImageFormat::Png).is_ok() {
+                                let png_bytes = buffer.into_inner();
+                                if png_bytes.len() <= MAX_IMAGE_DATA_BYTES {
+                                    let base64_str = STANDARD.encode(png_bytes);
+                                    return Ok(Some((
+                                        "image".to_string(),
+                                        format!("image|{}", base64_str),
+                                    )));
+                                }
+                            }
                         }
                     }
                 }
@@ -38,9 +130,15 @@ fn get_clipboard_data() -> Result<Option<(String, String)>, String> {
 
     if ctx.has(ContentFormat::Image) {
         if let Ok(image) = ctx.get_image() {
-            if let Ok(png_data) = image.to_png() {
-                let base64_str = STANDARD.encode(png_data.get_bytes());
-                return Ok(Some(("image".to_string(), format!("image|{}", base64_str))));
+            let (width, height) = image.get_size();
+            if validate_image_dimensions(width, height).is_ok() {
+                if let Ok(png_data) = image.to_png() {
+                    let png_bytes = png_data.get_bytes();
+                    if png_bytes.len() <= MAX_IMAGE_DATA_BYTES {
+                        let base64_str = STANDARD.encode(png_bytes);
+                        return Ok(Some(("image".to_string(), format!("image|{}", base64_str))));
+                    }
+                }
             }
         }
     }
@@ -58,8 +156,17 @@ fn get_clipboard_data() -> Result<Option<(String, String)>, String> {
 
 #[tauri::command]
 fn set_clipboard_image(base64: String) -> Result<(), String> {
+    let estimated_len = estimate_base64_decoded_len(&base64)?;
+    if estimated_len > MAX_IMAGE_DATA_BYTES {
+        return Err(format!(
+            "image payload exceeds size limit (max {} bytes)",
+            MAX_IMAGE_DATA_BYTES
+        ));
+    }
+
     let ctx = ClipboardContext::new().map_err(|e| e.to_string())?;
     let image_bytes = STANDARD.decode(base64).map_err(|e| e.to_string())?;
+    validate_image_bytes(&image_bytes)?;
     let img_data = RustImageData::from_bytes(&image_bytes).map_err(|e| e.to_string())?;
     ctx.set_image(img_data).map_err(|e| e.to_string())?;
     Ok(())
