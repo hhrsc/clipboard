@@ -18,15 +18,22 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0", features = ["tray-icon"] }
+tauri = { version = "2.0.0", features = ["protocol-asset", "tray-icon"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clipboard-rs = "0.2.1"
 base64 = "0.22.1"
-image = "0.25.1"
+image = { version = "0.25.1", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
 tauri-plugin-global-shortcut = "2.0.0"
 tauri-plugin-autostart = "2.0.0"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+debug = 0
+panic = "abort"

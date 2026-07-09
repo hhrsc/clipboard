@@ -3,7 +3,8 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clipboard_rs::common::RustImage;
 use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat, RustImageData};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
@@ -14,6 +15,9 @@ const MAX_IMAGE_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_IMAGE_DATA_BYTES: usize = 20 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 8192;
 const MAX_IMAGE_PIXELS: u64 = 20_000_000;
+const IMAGE_HISTORY_DIR_NAME: &str = "history-images";
+const MAX_HISTORY_IMAGE_FILES: usize = 10;
+const MAX_HISTORY_IMAGE_TOTAL_BYTES: u64 = 80 * 1024 * 1024;
 
 fn validate_image_dimensions(width: u32, height: u32) -> Result<(), String> {
     if width == 0 || height == 0 {
@@ -94,6 +98,59 @@ fn validate_image_bytes(bytes: &[u8]) -> Result<(), String> {
     validate_image_dimensions(width, height)
 }
 
+fn history_image_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    dir.push(IMAGE_HISTORY_DIR_NAME);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+fn cleanup_history_image_dir(dir: &Path) -> Result<(), String> {
+    let mut files: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|e| e.to_string())?;
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        files.push((path, modified, metadata.len()));
+    }
+
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut total_bytes = 0_u64;
+    for (idx, (path, _, len)) in files.iter().enumerate() {
+        total_bytes = total_bytes.saturating_add(*len);
+        if idx >= MAX_HISTORY_IMAGE_FILES || total_bytes > MAX_HISTORY_IMAGE_TOTAL_BYTES {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_history_image_path(raw: &str) -> Option<PathBuf> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let cleaned = raw.strip_prefix("file|").unwrap_or(raw).trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(cleaned))
+    }
+}
+
+fn path_is_within_dir(path: &Path, dir: &Path) -> bool {
+    match (path.canonicalize(), dir.canonicalize()) {
+        (Ok(p), Ok(d)) => p.starts_with(d),
+        _ => false,
+    }
+}
+
 #[tauri::command]
 fn set_clipboard_text(text: String) -> Result<(), String> {
     let ctx = ClipboardContext::new().map_err(|e| e.to_string())?;
@@ -171,6 +228,59 @@ fn set_clipboard_image(base64: String) -> Result<(), String> {
     validate_image_bytes(&image_bytes)?;
     let img_data = RustImageData::from_bytes(&image_bytes).map_err(|e| e.to_string())?;
     ctx.set_image(img_data).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_clipboard_image_from_path(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    let image_bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    validate_image_bytes(&image_bytes)?;
+
+    let ctx = ClipboardContext::new().map_err(|e| e.to_string())?;
+    let img_data = RustImageData::from_bytes(&image_bytes).map_err(|e| e.to_string())?;
+    ctx.set_image(img_data).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn persist_history_image(app: tauri::AppHandle, base64: String) -> Result<String, String> {
+    let estimated_len = estimate_base64_decoded_len(&base64)?;
+    if estimated_len > MAX_IMAGE_DATA_BYTES {
+        return Err(format!(
+            "image payload exceeds size limit (max {} bytes)",
+            MAX_IMAGE_DATA_BYTES
+        ));
+    }
+
+    let image_bytes = STANDARD.decode(base64).map_err(|e| e.to_string())?;
+    validate_image_bytes(&image_bytes)?;
+
+    let dir = history_image_dir(&app)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let file_name = format!("img-{}-{}.png", stamp, std::process::id());
+    let file_path = dir.join(file_name);
+
+    std::fs::write(&file_path, image_bytes).map_err(|e| e.to_string())?;
+    cleanup_history_image_dir(&dir)?;
+    Ok(file_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn delete_history_images(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
+    let dir = history_image_dir(&app)?;
+    for raw in paths {
+        let Some(path) = normalize_history_image_path(&raw) else {
+            continue;
+        };
+        if path.exists() && path_is_within_dir(&path, &dir) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    cleanup_history_image_dir(&dir)?;
     Ok(())
 }
 
@@ -264,7 +374,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             set_clipboard_text,
             get_clipboard_data,
-            set_clipboard_image
+            set_clipboard_image,
+            set_clipboard_image_from_path,
+            persist_history_image,
+            delete_history_images
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,5 +1,5 @@
 <script>
-  import { invoke } from '@tauri-apps/api/core';
+  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import { afterUpdate, onMount } from 'svelte';
   import { fade, fly, scale } from 'svelte/transition';
 
@@ -9,15 +9,35 @@
   const PASSWORDS_KEY = 'clip_v5_passwords';
   const CATEGORIES_KEY = 'clip_v5_categories';
 
+  /**
+   * @typedef {Object} HistoryItem
+   * @property {'text' | 'image' | string} type
+   * @property {string} content
+   * @property {number} id
+   * @property {string} timestamp
+   * @property {string=} category
+   */
+
+  /**
+   * @typedef {Object} PasswordItem
+   * @property {number} id
+   * @property {string} title
+   * @property {string} username
+   * @property {string} password
+   * @property {boolean} showPass
+   */
+
   let activeTab = 'clipboard';
   let showToast = false;
   let toastMsg = 'Copied!';
 
   let searchQuery = '';
+  /** @type {HistoryItem[]} */
   let history = [];
   let lastData = '';
 
   let pwdSearchQuery = '';
+  /** @type {PasswordItem[]} */
   let passwords = [];
   let newPwdTitle = '';
   let newPwdUser = '';
@@ -36,10 +56,21 @@
   let menuY = 0;
   let targetCategory = '';
 
+  let showImageMenu = false;
+  let imageMenuX = 0;
+  let imageMenuY = 0;
+  /** @type {HistoryItem | null} */
+  let targetImage = null;
+  /** @type {HistoryItem | null} */
+  let previewImage = null;
+  let previewScale = 1;
+
   let isRenamingCat = false;
   let renameCatName = '';
 
+  /** @type {HTMLButtonElement | undefined} */
   let clipboardTabEl;
+  /** @type {HTMLButtonElement | undefined} */
   let passwordTabEl;
   let tabLineX = 0;
   let tabLineW = 0;
@@ -54,15 +85,95 @@
     if (nextW !== tabLineW) tabLineW = nextW;
   }
 
+  /** @param {WheelEvent & { currentTarget: HTMLElement }} event */
   function handleCategoryWheel(event) {
-    if (!event.currentTarget) return;
     const delta = Math.abs(event.deltaY) > Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
     event.currentTarget.scrollLeft += delta;
   }
 
+  /** @param {number} nextScale */
+  function clampPreviewScale(nextScale) {
+    return Math.min(4, Math.max(0.2, Number(nextScale.toFixed(2))));
+  }
+
   afterUpdate(syncTabIndicator);
 
+  /** @param {string} content */
+  function imageClipboardSignature(content) {
+    if (!content) return '';
+    const payload = content.includes('|') ? content.split('|')[1] : content;
+    if (!payload) return '';
+    const head = payload.slice(0, 32);
+    const tail = payload.slice(-32);
+    return `image:${payload.length}:${head}:${tail}`;
+  }
+
+  /**
+   * @param {string} type
+   * @param {string} content
+   */
+  function clipboardSignature(type, content) {
+    if (type === 'image') return imageClipboardSignature(content);
+    return content || '';
+  }
+
+  /** @param {unknown} content */
+  function isFileImageContent(content) {
+    return typeof content === 'string' && content.startsWith('file|');
+  }
+
+  /** @param {string} rawContent */
+  async function persistImageContent(rawContent) {
+    if (!rawContent) return '';
+    const base64 = rawContent.includes('|') ? rawContent.split('|')[1] : rawContent;
+    if (!base64) return '';
+    const path = /** @type {string} */ (await invoke('persist_history_image', { base64 }));
+    return `file|${path}`;
+  }
+
+  /** @param {HistoryItem[]} items */
+  function collectImagePaths(items) {
+    return items
+      .filter((item) => item.type !== 'text' && isFileImageContent(item.content))
+      .map((item) => item.content.slice(5));
+  }
+
+  /** @param {HistoryItem[]} items */
+  async function cleanupImageFilesFromItems(items) {
+    const paths = collectImagePaths(items);
+    if (paths.length === 0) return;
+    try {
+      await invoke('delete_history_images', { paths });
+    } catch {
+      // ignore file cleanup failures
+    }
+  }
+
+  async function migrateLegacyImageItems() {
+    let changed = false;
+    /** @type {HistoryItem[]} */
+    const migrated = [];
+    for (const item of history) {
+      if (item.type !== 'text' && item.content && !isFileImageContent(item.content)) {
+        try {
+          const fileContent = await persistImageContent(item.content);
+          migrated.push({ ...item, content: fileContent });
+          changed = true;
+          continue;
+        } catch {
+          // keep original item if migration fails
+        }
+      }
+      migrated.push(item);
+    }
+    if (changed) {
+      updateAndSaveHistory(migrated);
+    }
+  }
+
+  /** @param {HistoryItem[]} newArray */
   function updateAndSaveHistory(newArray) {
+    const previousHistory = history;
     const EXPIRATION_MS = 24 * 60 * 60 * 1000;
     const now = Date.now();
 
@@ -84,9 +195,17 @@
     const merged = [...imgs.slice(0, 10), ...categorizedTexts, ...uncategorizedTexts.slice(0, 50)];
     merged.sort((a, b) => b.id - a.id);
 
+    const mergedIds = new Set(merged.map((item) => item.id));
+    const removedImages = previousHistory.filter(
+      (item) => item.type !== 'text' && !mergedIds.has(item.id)
+    );
+
     history = merged;
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
     localStorage.setItem(LAST_DATA_KEY, lastData);
+    if (removedImages.length > 0) {
+      void cleanupImageFilesFromItems(removedImages);
+    }
   }
 
   function savePasswords() {
@@ -134,6 +253,7 @@
     }
 
     updateAndSaveHistory(history);
+    void migrateLegacyImageItems();
 
     const clipboardInterval = setInterval(async () => {
       const now = Date.now();
@@ -153,25 +273,31 @@
         const data = await invoke('get_clipboard_data');
         if (data) {
           const [type, content] = data;
-          if (content !== lastData) {
+          const signature = clipboardSignature(type, content);
+          if (signature !== lastData) {
             if (isAppCopying && type === 'image') {
-              lastData = content;
+              lastData = signature;
               isAppCopying = false;
               updateAndSaveHistory(history);
               return;
+            }
+
+            let storedContent = content;
+            if (type === 'image') {
+              storedContent = await persistImageContent(content);
             }
 
             const defaultCat =
               type === 'text' && activeCategory !== DEFAULT_CATEGORY ? activeCategory : DEFAULT_CATEGORY;
             const newItem = {
               type,
-              content,
+              content: storedContent,
               id: Date.now(),
               timestamp: new Date().toLocaleString(),
               category: defaultCat
             };
 
-            lastData = content;
+            lastData = signature;
             updateAndSaveHistory([newItem, ...history]);
           }
         }
@@ -180,6 +306,7 @@
       }
     }, 2000);
 
+    /** @param {ClipboardEvent} e */
     const handlePaste = (e) => {
       const active = document.activeElement;
       if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
@@ -191,30 +318,39 @@
           const blob = items[i].getAsFile();
           if (!blob) continue;
           const reader = new FileReader();
-          reader.onload = (event) => {
+          reader.onload = async (event) => {
             const result = event?.target?.result;
             if (typeof result !== 'string') return;
             const base64 = result.split(',')[1];
             if (!base64) return;
 
             const content = `image|${base64}`;
-            if (content !== lastData) {
+            const signature = clipboardSignature('image', content);
+            if (signature !== lastData) {
+              let storedContent = content;
+              try {
+                storedContent = await persistImageContent(content);
+              } catch {
+                return;
+              }
               const newItem = {
                 type: 'image',
-                content,
+                content: storedContent,
                 id: Date.now(),
                 timestamp: new Date().toLocaleString(),
                 category: DEFAULT_CATEGORY
               };
-              lastData = content;
+              lastData = signature;
               updateAndSaveHistory([newItem, ...history]);
               triggerToast('Image Pasted!');
             }
           };
           reader.readAsDataURL(blob);
         } else if (items[i].type === 'text/plain') {
+          /** @param {string} text */
           items[i].getAsString((text) => {
-            if (text !== lastData) {
+            const signature = clipboardSignature('text', text);
+            if (signature !== lastData) {
               const defaultCat = activeCategory !== DEFAULT_CATEGORY ? activeCategory : DEFAULT_CATEGORY;
               const newItem = {
                 type: 'text',
@@ -223,7 +359,7 @@
                 timestamp: new Date().toLocaleString(),
                 category: defaultCat
               };
-              lastData = text;
+              lastData = signature;
               updateAndSaveHistory([newItem, ...history]);
               triggerToast('Text Pasted!');
             }
@@ -240,6 +376,7 @@
     };
   });
 
+  /** @param {string} [msg] */
   function triggerToast(msg = 'Copied!') {
     toastMsg = msg;
     showToast = true;
@@ -248,20 +385,26 @@
     }, 900);
   }
 
+  /** @param {string} text */
   async function copyText(text) {
     if (!text) return;
     await invoke('set_clipboard_text', { text });
-    lastData = text;
+    lastData = clipboardSignature('text', text);
     updateAndSaveHistory(history);
     triggerToast('Copied');
   }
 
+  /** @param {string} content */
   async function copyImage(content) {
     if (!content) return;
     try {
       isAppCopying = true;
-      const base64 = content.includes('|') ? content.split('|')[1] : content;
-      await invoke('set_clipboard_image', { base64 });
+      if (isFileImageContent(content)) {
+        await invoke('set_clipboard_image_from_path', { path: content.slice(5) });
+      } else {
+        const base64 = content.includes('|') ? content.split('|')[1] : content;
+        await invoke('set_clipboard_image', { base64 });
+      }
       triggerToast('Image Copied');
       setTimeout(() => {
         isAppCopying = false;
@@ -271,23 +414,36 @@
     }
   }
 
+  /** @param {number} id */
   async function deleteItem(id) {
     const item = history.find((it) => it.id === id);
     const newHistory = history.filter((it) => it.id !== id);
-    if (item && item.content === lastData) {
+    if (previewImage?.id === id) closeImagePreview();
+    if (targetImage?.id === id) {
+      targetImage = null;
+      closeImageMenu();
+    }
+    if (item?.type === 'text' && item.content === lastData) {
       await invoke('set_clipboard_text', { text: '' });
       lastData = '';
+    }
+    if (item && item.type !== 'text') {
+      await cleanupImageFilesFromItems([item]);
     }
     updateAndSaveHistory(newHistory);
   }
 
   async function clearImages() {
-    const hasLastData = history.some((it) => it.type !== 'text' && it.content === lastData);
+    const removedImages = history.filter((item) => item.type !== 'text');
     const newHistory = history.filter((item) => item.type === 'text');
-    if (hasLastData) {
+    if (previewImage) closeImagePreview();
+    targetImage = null;
+    closeImageMenu();
+    if (lastData.startsWith('image:')) {
       await invoke('set_clipboard_text', { text: '' });
       lastData = '';
     }
+    await cleanupImageFilesFromItems(removedImages);
     updateAndSaveHistory(newHistory);
   }
 
@@ -317,21 +473,86 @@
     newCatName = '';
   }
 
+  /**
+   * @param {number} id
+   * @param {string} newCat
+   */
   function changeCategory(id, newCat) {
     const newHistory = history.map((item) => (item.id === id ? { ...item, category: newCat } : item));
     updateAndSaveHistory(newHistory);
   }
 
+  /**
+   * @param {MouseEvent} e
+   * @param {string} cat
+   */
   function handleContextMenu(e, cat) {
     if (cat === DEFAULT_CATEGORY) return;
     targetCategory = cat;
     menuX = e.clientX;
     menuY = e.clientY;
+    showImageMenu = false;
     showContextMenu = true;
   }
 
   function closeContextMenu() {
     showContextMenu = false;
+  }
+
+  /**
+   * @param {MouseEvent} e
+   * @param {HistoryItem} item
+   */
+  function handleImageContextMenu(e, item) {
+    targetImage = item;
+    imageMenuX = e.clientX;
+    imageMenuY = e.clientY;
+    showContextMenu = false;
+    showImageMenu = true;
+  }
+
+  function closeImageMenu() {
+    showImageMenu = false;
+  }
+
+  /** @param {HistoryItem | null} [item] */
+  function openImagePreview(item = targetImage) {
+    if (!item) return;
+    previewImage = item;
+    previewScale = 1;
+    closeImageMenu();
+  }
+
+  function closeImagePreview() {
+    previewImage = null;
+    previewScale = 1;
+  }
+
+  /** @param {number} delta */
+  function zoomPreview(delta) {
+    previewScale = clampPreviewScale(previewScale + delta);
+  }
+
+  /** @param {WheelEvent} event */
+  function handlePreviewWheel(event) {
+    const delta = event.deltaY < 0 ? 0.15 : -0.15;
+    zoomPreview(delta);
+  }
+
+  /** @param {KeyboardEvent} event */
+  function handleWindowKeydown(event) {
+    if (event.key === 'Escape') {
+      closeImageMenu();
+      closeContextMenu();
+      if (previewImage) closeImagePreview();
+    }
+  }
+
+  /** @param {MouseEvent} event */
+  function handlePreviewBackdropMouseDown(event) {
+    if (event.target === event.currentTarget) {
+      closeImagePreview();
+    }
   }
 
   function startRename() {
@@ -384,6 +605,7 @@
     triggerToast('Saved');
   }
 
+  /** @param {number} id */
   function deletePassword(id) {
     passwords = passwords.filter((pwd) => pwd.id !== id);
     savePasswords();
@@ -394,12 +616,18 @@
     savePasswords();
   }
 
+  /** @param {number} id */
   function togglePassword(id) {
     passwords = passwords.map((pwd) => (pwd.id === id ? { ...pwd, showPass: !pwd.showPass } : pwd));
   }
 
+  /** @param {string} content */
   function getImgSrc(content) {
     try {
+      if (isFileImageContent(content)) {
+        const path = content.slice(5);
+        return convertFileSrc(path);
+      }
       const base64 = content.includes('|') ? content.split('|')[1] : content;
       return `data:image/png;base64,${base64}`;
     } catch {
@@ -417,7 +645,14 @@
     : passwords;
 </script>
 
-<svelte:window on:click={closeContextMenu} on:resize={syncTabIndicator} />
+<svelte:window
+  on:click={() => {
+    closeContextMenu();
+    closeImageMenu();
+  }}
+  on:keydown={handleWindowKeydown}
+  on:resize={syncTabIndicator}
+/>
 
 <main class="app-shell">
   <nav class="top-tabs">
@@ -499,6 +734,7 @@
                 role="button"
                 tabindex="0"
                 on:click={() => copyImage(item.content)}
+                on:contextmenu|preventDefault={(e) => handleImageContextMenu(e, item)}
                 on:keydown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
@@ -605,7 +841,12 @@
               <div class="text-main">
                 <div class="text-title" title={item.content}>{item.content}</div>
                 <div class="text-meta">
-                  <select class="cat-select" value={item.category || DEFAULT_CATEGORY} on:change={(e) => changeCategory(item.id, e.target.value)} on:click|stopPropagation>
+                  <select
+                    class="cat-select"
+                    value={item.category || DEFAULT_CATEGORY}
+                    on:change={(e) => changeCategory(item.id, e.currentTarget.value)}
+                    on:click|stopPropagation
+                  >
                     {#each categories as cat}
                       <option value={cat}>{cat}</option>
                     {/each}
@@ -813,6 +1054,76 @@
         </svg>
         删除分类
       </button>
+    </div>
+  {/if}
+
+  {#if showImageMenu && targetImage}
+    <div
+      class="context-menu image-menu"
+      style="left: {imageMenuX}px; top: {imageMenuY}px;"
+      role="menu"
+      tabindex="-1"
+      aria-label="Image menu"
+      in:fade={{ duration: 100 }}
+      on:mousedown|stopPropagation
+    >
+      <button class="menu-item" on:click={() => openImagePreview()}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7" />
+          <line x1="16.5" y1="16.5" x2="21" y2="21" />
+          <line x1="11" y1="8" x2="11" y2="14" />
+          <line x1="8" y1="11" x2="14" y2="11" />
+        </svg>
+        Preview
+      </button>
+    </div>
+  {/if}
+
+  {#if previewImage}
+    <div
+      class="preview-backdrop"
+      role="dialog"
+      tabindex="-1"
+      aria-modal="true"
+      aria-label="Image preview"
+      transition:fade={{ duration: 120 }}
+      on:mousedown={handlePreviewBackdropMouseDown}
+    >
+      <div class="preview-stage" role="document">
+        <div class="preview-toolbar">
+          <button class="preview-tool" on:click={() => zoomPreview(-0.2)} aria-label="Zoom out">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7" />
+              <line x1="8" y1="11" x2="14" y2="11" />
+              <line x1="16.5" y1="16.5" x2="21" y2="21" />
+            </svg>
+          </button>
+          <button class="preview-tool reset" on:click={() => (previewScale = 1)} aria-label="Reset zoom">
+            {Math.round(previewScale * 100)}%
+          </button>
+          <button class="preview-tool" on:click={() => zoomPreview(0.2)} aria-label="Zoom in">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7" />
+              <line x1="11" y1="8" x2="11" y2="14" />
+              <line x1="8" y1="11" x2="14" y2="11" />
+              <line x1="16.5" y1="16.5" x2="21" y2="21" />
+            </svg>
+          </button>
+          <button class="preview-tool" on:click={closeImagePreview} aria-label="Close preview">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+        <div class="preview-scroll" on:wheel|preventDefault={handlePreviewWheel}>
+          <img
+            src={getImgSrc(previewImage.content)}
+            alt="Preview"
+            style="transform: scale({previewScale});"
+          />
+        </div>
+      </div>
     </div>
   {/if}
 </main>
@@ -1165,12 +1476,100 @@
   .toast-tip { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); background: #1f2f4d; color: #fff; font-size: 12px; padding: 7px 12px; border-radius: 999px; box-shadow: 0 12px 20px rgba(20,33,58,.28); z-index: 9999; }
 
   .context-menu { position: fixed; min-width: 140px; border: 1px solid #d5e3f5; background: #fff; border-radius: 10px; box-shadow: 0 14px 26px rgba(80,118,173,.24); padding: 6px; z-index: 10000; }
+  .image-menu { min-width: 132px; }
   .menu-item { width: 100%; border: none; background: transparent; border-radius: 8px; display: flex; align-items: center; gap: 8px; padding: 8px 10px; color: #4d607f; cursor: pointer; transition: all .2s ease; font-size: 14px; }
   .menu-item svg { width: 16px; height: 16px; }
   .menu-item:hover { background: #f0f6ff; color: #20426f; }
   .menu-item.danger { color: #d05567; }
   .menu-item.danger:hover { background: #fff1f3; color: #cc4256; }
   .menu-divider { height: 1px; background: #e1eaf6; margin: 4px 0; }
+
+  .preview-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 10001;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    background: rgba(12, 21, 38, 0.72);
+  }
+
+  .preview-stage {
+    width: min(94vw, 1080px);
+    height: min(90vh, 760px);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .preview-toolbar {
+    align-self: center;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px;
+    border: 1px solid rgba(218, 229, 245, 0.34);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.96);
+    box-shadow: 0 14px 30px rgba(7, 16, 31, 0.28);
+  }
+
+  .preview-tool {
+    width: 34px;
+    height: 34px;
+    border: 1px solid #d8e5f5;
+    border-radius: 9px;
+    background: #f7fbff;
+    color: #37506f;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    cursor: pointer;
+    transition: all .18s ease;
+  }
+
+  .preview-tool svg { width: 17px; height: 17px; }
+  .preview-tool:hover { background: #eaf4ff; color: #1f5c9d; border-color: #b9d7f5; }
+
+  .preview-tool.reset {
+    width: 58px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #233a59;
+  }
+
+  .preview-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    display: grid;
+    place-items: center;
+    border: 1px solid rgba(218, 229, 245, 0.22);
+    border-radius: 14px;
+    background:
+      linear-gradient(45deg, rgba(255,255,255,.13) 25%, transparent 25%),
+      linear-gradient(-45deg, rgba(255,255,255,.13) 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, rgba(255,255,255,.13) 75%),
+      linear-gradient(-45deg, transparent 75%, rgba(255,255,255,.13) 75%),
+      rgba(15, 26, 46, 0.66);
+    background-size: 28px 28px;
+    background-position: 0 0, 0 14px, 14px -14px, -14px 0;
+  }
+
+  .preview-scroll img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    transform-origin: center center;
+    transition: transform .12s ease;
+    box-shadow: 0 18px 46px rgba(0, 0, 0, 0.32);
+    user-select: none;
+    -webkit-user-drag: none;
+  }
 
   input::-ms-reveal,
   input::-ms-clear,
