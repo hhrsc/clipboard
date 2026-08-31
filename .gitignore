@@ -29,3 +29,7 @@ src-tauri/target/
 /static/design/
 /static/handoff/
 /tmp_screenshot*.png
+/design-qa/
+/nu1
+/src-tauri/nu1
+/src-tauri/2
