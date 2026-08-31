@@ -1,0 +1,13 @@
+{
+  "format": "my-clipboard-passwords",
+  "version": 2,
+  "collections": [
+    { "id": "sample-work", "name": "QA Work" },
+    { "id": "sample-personal", "name": "QA Personal" }
+  ],
+  "passwords": [
+    { "title": "QA Alpha", "username": "alpha@example.invalid", "password": "synthetic-only-alpha", "collectionId": "sample-work" },
+    { "title": "QA Beta", "username": "", "password": "synthetic-only-beta", "collectionId": "sample-personal" },
+    { "title": "QA Gamma", "username": "gamma@example.invalid", "password": "synthetic-only-gamma", "collectionId": null }
+  ]
+}

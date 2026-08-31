@@ -5,19 +5,23 @@ async (page) => {
   const check = (name, pass) => { results.push({ name, pass }); if (!pass) throw new Error(name); };
   try {
     await page.locator('.ref-primary-nav').getByRole('button', { name: 'Passwords', exact: true }).click();
-    if (!(await invoke('vault_status')).unlocked) {
-      await page.getByLabel('Master password', { exact: true }).fill('Phase2-QA-only-master-8431');
+    const status = await invoke('vault_status');
+    let masterPassword = 'Phase2-QA-8431';
+    try { await invoke('vault_unlock', { masterPassword }); }
+    catch { masterPassword = 'Phase2-QA-only-master-8431'; }
+    if (!status.unlocked) {
+      await page.getByLabel('Master password', { exact: true }).fill(masterPassword);
       await page.getByRole('button', { name: 'Unlock vault', exact: true }).click();
     }
     await page.getByRole('button', { name: 'Add password', exact: true }).waitFor();
     await page.locator('input[type=file]').setInputFiles('scripts/fixtures/passwords-qa.json');
     await page.locator('.password-row').filter({ hasText: 'PHASE2-QA imported' }).waitFor();
-    check('JSON import through existing file input handler', (await invoke('vault_unlock', { masterPassword: 'Phase2-QA-only-master-8431' })).some(p => p.title === 'PHASE2-QA imported'));
+    check('JSON import through existing file input handler', (await invoke('vault_unlock', { masterPassword })).passwords.some(p => p.title === 'PHASE2-QA imported'));
     await page.locator('.password-row').filter({ hasText: 'PHASE2-QA imported' }).click();
     await page.locator('.password-detail').getByRole('button', { name: 'More', exact: true }).click();
     await page.getByRole('button', { name: 'Delete password', exact: true }).click();
     await page.waitForFunction(() => ![...document.querySelectorAll('.password-row')].some(e => e.textContent.includes('PHASE2-QA imported')));
-    check('password deletion persisted', !(await invoke('vault_unlock', { masterPassword: 'Phase2-QA-only-master-8431' })).some(p => p.title === 'PHASE2-QA imported'));
+    check('password deletion persisted', !(await invoke('vault_unlock', { masterPassword })).passwords.some(p => p.title === 'PHASE2-QA imported'));
     await invoke('vault_lock');
     const store = await invoke('clipboard_store_load');
     const sample = store.records.find(r => r.type === 'image');

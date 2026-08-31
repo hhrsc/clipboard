@@ -1,10 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod local_vault_unlock;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use clipboard_rs::common::RustImage;
-use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat, RustImageData};
+use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext, ContentFormat, RustImageData};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -28,7 +30,10 @@ const IMAGE_HISTORY_DIR_NAME: &str = "history-images";
 const MAX_HISTORY_IMAGE_FILES: usize = 10;
 const MAX_HISTORY_IMAGE_TOTAL_BYTES: u64 = 80 * 1024 * 1024;
 const VAULT_FILE_NAME: &str = "password-vault.json";
-const VAULT_VERSION: u32 = 1;
+const VAULT_LOCAL_UNLOCK_FILE: &str = "password-vault-unlock.bin";
+const VAULT_VERSION: u32 = 2;
+const MAX_HTML_BYTES: usize = 1024 * 1024;
+const RESET_MARKER: &str = "reset-in-progress.json";
 const VAULT_SALT_BYTES: usize = 16;
 const VAULT_NONCE_BYTES: usize = 12;
 const VAULT_KEY_BYTES: usize = 32;
@@ -48,6 +53,9 @@ const MAX_CLIPBOARD_CATEGORIES: usize = 100;
 struct VaultRuntime {
     key: Mutex<Option<Zeroizing<[u8; VAULT_KEY_BYTES]>>>,
 }
+
+#[derive(Default)]
+struct MutationRuntime(Mutex<()>);
 
 impl Default for VaultRuntime {
     fn default() -> Self {
@@ -72,13 +80,23 @@ struct VaultPassword {
     title: String,
     username: String,
     password: String,
+    #[serde(default)]
+    collection_id: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+struct VaultCollection {
+    id: String,
+    name: String,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VaultPayload {
     version: u32,
     passwords: Vec<VaultPassword>,
+    #[serde(default)]
+    collections: Vec<VaultCollection>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -105,6 +123,8 @@ struct VaultFile {
 struct VaultStatus {
     exists: bool,
     unlocked: bool,
+    require_password: bool,
+    auto_unlock_available: bool,
 }
 
 #[derive(Serialize)]
@@ -138,6 +158,8 @@ struct ClipboardRecord {
     #[serde(rename = "type")]
     kind: String,
     content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    html: Option<String>,
     id: u64,
     timestamp: String,
     category_id: String,
@@ -195,6 +217,29 @@ struct ClipboardStore {
 struct ClipboardStoreStatus {
     exists: bool,
     version: Option<u32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardSnapshot {
+    #[serde(rename = "type")]
+    kind: String,
+    content: String,
+    html: Option<String>,
+    warning: Option<String>,
+}
+
+fn reset_marker_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app.path().app_data_dir().map_err(|e| e.to_string())?.join(RESET_MARKER))
+}
+
+fn mutate<T>(app: &tauri::AppHandle, operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let state = app.state::<MutationRuntime>();
+    let _guard = state.0.lock().map_err(|_| "application storage is busy".to_string())?;
+    if reset_marker_path(app)?.exists() {
+        return Err("An app reset is pending. Complete the reset before making changes.".to_string());
+    }
+    operation()
 }
 
 fn validate_image_dimensions(width: u32, height: u32) -> Result<(), String> {
@@ -339,6 +384,14 @@ fn vault_backup_path(path: &Path) -> PathBuf {
     path.with_extension("bak")
 }
 
+fn vault_local_unlock_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(vault_path(app)?.with_file_name(VAULT_LOCAL_UNLOCK_FILE))
+}
+
+fn vault_local_unlock_context(app: &tauri::AppHandle, vault: &VaultFile) -> Vec<u8> {
+    format!("{}:vault-unlock:{}", app.config().identifier, vault.salt).into_bytes()
+}
+
 fn shortcut_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -349,9 +402,8 @@ fn normalize_shortcut(raw: &str) -> Result<String, String> {
     let parts = raw
         .split('+')
         .map(|part| part.trim().to_ascii_uppercase())
-        .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
-    if !(2..=3).contains(&parts.len()) {
+    if !(2..=4).contains(&parts.len()) {
         return Err("shortcut must contain a modifier and one letter or number".to_string());
     }
 
@@ -377,6 +429,7 @@ fn normalize_shortcut(raw: &str) -> Result<String, String> {
         return Err("shortcut must include Alt or Ctrl".to_string());
     }
 
+    modifiers.sort_by_key(|modifier| match *modifier { "Ctrl" => 0, "Alt" => 1, _ => 2 });
     let mut normalized = modifiers.join("+");
     normalized.push('+');
     normalized.push_str(&key);
@@ -466,6 +519,7 @@ fn validate_clipboard_store(store: &ClipboardStore) -> Result<(), String> {
             || (record.kind != "text" && record.kind != "image")
             || record.content.is_empty()
             || record.content.len() > content_limit
+            || record.html.as_ref().is_some_and(|html| record.kind != "text" || html.len() > MAX_HTML_BYTES)
             || record.timestamp.len() > 200
             || !category_ids.contains(&record.category_id)
             || !record_ids.insert(record.id)
@@ -549,6 +603,7 @@ fn migrate_legacy_clipboard_store(
         store.records.push(ClipboardRecord {
             kind: legacy.kind,
             content: legacy.content,
+            html: None,
             id: legacy.id,
             timestamp: legacy.timestamp,
             category_id,
@@ -635,8 +690,8 @@ fn export_backup_file(path: &str, vault: &VaultFile) -> Result<(), String> {
 }
 
 fn validate_master_password(master_password: &str) -> Result<(), String> {
-    if master_password.chars().count() < 12 {
-        return Err("master password must contain at least 12 characters".to_string());
+    if !(8..=16).contains(&master_password.chars().count()) {
+        return Err("master password must contain 8-16 characters".to_string());
     }
     Ok(())
 }
@@ -658,8 +713,35 @@ fn validate_passwords(passwords: &[VaultPassword]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_vault_payload(payload: &VaultPayload) -> Result<(), String> {
+    validate_passwords(&payload.passwords)?;
+    let mut ids = HashSet::new();
+    let mut names = HashSet::new();
+    if payload.collections.len() > 100 {
+        return Err("Too many password collections".to_string());
+    }
+    for collection in &payload.collections {
+        if collection.id.is_empty() || collection.id.len() > 64
+            || collection.name.trim().is_empty() || collection.name.len() > 120
+            || collection.name != collection.name.trim()
+            || !ids.insert(collection.id.clone()) || !names.insert(collection.name.to_lowercase()) {
+            return Err("Invalid or duplicate password collection".to_string());
+        }
+    }
+    let mut password_ids = HashSet::new();
+    for password in &payload.passwords {
+        if !password_ids.insert(password.id) || password.collection_id.as_ref().is_some_and(|id| !ids.contains(id)) {
+            return Err("Invalid password collection reference or duplicate ID".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn derive_vault_key(master_password: &str, salt: &[u8], kdf: &VaultKdf) -> Result<[u8; VAULT_KEY_BYTES], String> {
-    validate_master_password(master_password)?;
+    // 长度策略只限制新密码，已有密码库仍按原密码派生密钥。
+    if master_password.is_empty() {
+        return Err("master password is required".to_string());
+    }
     if kdf.algorithm != "argon2id"
         || salt.len() != VAULT_SALT_BYTES
         || kdf.memory_kib < VAULT_ARGON_MEMORY_KIB
@@ -706,7 +788,7 @@ fn encrypt_payload(payload: &VaultPayload, key: &[u8; VAULT_KEY_BYTES], kdf: Vau
 }
 
 fn decrypt_payload(vault: &VaultFile, key: &[u8; VAULT_KEY_BYTES]) -> Result<VaultPayload, String> {
-    if vault.version != VAULT_VERSION {
+    if !(1..=VAULT_VERSION).contains(&vault.version) {
         return Err("password vault version is unsupported".to_string());
     }
     let nonce = STANDARD.decode(&vault.nonce).map_err(|_| "password vault is invalid".to_string())?;
@@ -719,15 +801,21 @@ fn decrypt_payload(vault: &VaultFile, key: &[u8; VAULT_KEY_BYTES]) -> Result<Vau
         .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
         .map_err(|_| "master password is incorrect or password vault is damaged".to_string())?;
     let payload: VaultPayload = serde_json::from_slice(&plaintext).map_err(|_| "password vault is invalid".to_string())?;
-    if payload.version != VAULT_VERSION {
+    if !(1..=VAULT_VERSION).contains(&payload.version) {
         return Err("password vault version is unsupported".to_string());
     }
-    validate_passwords(&payload.passwords)?;
+    validate_vault_payload(&payload)?;
     Ok(payload)
 }
 
 fn create_vault_file(master_password: &str, passwords: Vec<VaultPassword>) -> Result<(VaultFile, [u8; VAULT_KEY_BYTES]), String> {
-    validate_passwords(&passwords)?;
+    create_vault_snapshot(master_password, VaultPayload { version: VAULT_VERSION, passwords, collections: Vec::new() })
+}
+
+fn create_vault_snapshot(master_password: &str, mut payload: VaultPayload) -> Result<(VaultFile, [u8; VAULT_KEY_BYTES]), String> {
+    validate_master_password(master_password)?;
+    validate_vault_payload(&payload)?;
+    payload.version = VAULT_VERSION;
     let mut salt = [0_u8; VAULT_SALT_BYTES];
     OsRng.fill_bytes(&mut salt);
     let kdf = VaultKdf {
@@ -737,7 +825,6 @@ fn create_vault_file(master_password: &str, passwords: Vec<VaultPassword>) -> Re
         parallelism: VAULT_ARGON_PARALLELISM,
     };
     let key = derive_vault_key(master_password, &salt, &kdf)?;
-    let payload = VaultPayload { version: VAULT_VERSION, passwords };
     let vault = encrypt_payload(&payload, &key, kdf, &salt)?;
     Ok((vault, key))
 }
@@ -750,7 +837,7 @@ fn rotate_vault_master_password(
     let salt = STANDARD.decode(&vault.salt).map_err(|_| "password vault is invalid".to_string())?;
     let current_key = derive_vault_key(current_master_password, &salt, &vault.kdf)?;
     let payload = decrypt_payload(vault, &current_key)?;
-    create_vault_file(next_master_password, payload.passwords)
+    create_vault_snapshot(next_master_password, payload)
 }
 
 fn active_vault_key(state: &tauri::State<VaultRuntime>) -> Result<Zeroizing<[u8; VAULT_KEY_BYTES]>, String> {
@@ -777,7 +864,47 @@ fn vault_status(app: tauri::AppHandle, state: tauri::State<VaultRuntime>) -> Res
         .lock()
         .map_err(|_| "password vault is unavailable".to_string())?
         .is_some();
-    Ok(VaultStatus { exists: vault_exists(&app)?, unlocked })
+    Ok(VaultStatus {
+        exists: vault_exists(&app)?, unlocked,
+        require_password: !vault_local_unlock_path(&app)?.try_exists().map_err(|e| e.to_string())?,
+        auto_unlock_available: cfg!(windows),
+    })
+}
+
+#[tauri::command]
+fn vault_set_require_password(
+    app: tauri::AppHandle,
+    state: tauri::State<VaultRuntime>,
+    require_password: bool,
+    master_password: String,
+) -> Result<(), String> {
+    let master_password = Zeroizing::new(master_password);
+    mutate(&app, || {
+        let vault = read_vault_file(&app)?;
+        let mut active = state.key.lock().map_err(|_| "password vault is unavailable".to_string())?;
+        configure_vault_access(&vault_local_unlock_path(&app)?, &vault, &master_password, require_password, &vault_local_unlock_context(&app, &vault))?;
+        if require_password { *active = None; }
+        Ok(())
+    })
+}
+
+fn configure_vault_access(path: &Path, vault: &VaultFile, master_password: &str, require_password: bool, context: &[u8]) -> Result<(), String> {
+    let salt = STANDARD.decode(&vault.salt).map_err(|_| "password vault is invalid".to_string())?;
+    let key = Zeroizing::new(derive_vault_key(master_password, &salt, &vault.kdf)?);
+    decrypt_payload(vault, &key)?;
+    if require_password { local_vault_unlock::remove(path) }
+    else { local_vault_unlock::save(path, &key, context) }
+}
+
+#[tauri::command]
+fn vault_auto_unlock(app: tauri::AppHandle, state: tauri::State<VaultRuntime>) -> Result<VaultPayload, String> {
+    mutate(&app, || {
+        let vault = read_vault_file(&app)?;
+        let key = local_vault_unlock::read(&vault_local_unlock_path(&app)?, &vault_local_unlock_context(&app, &vault))?;
+        let payload = decrypt_payload(&vault, &key)?;
+        store_vault_key(&state, *key)?;
+        Ok(payload)
+    })
 }
 
 #[tauri::command]
@@ -786,18 +913,21 @@ fn vault_setup(
     state: tauri::State<VaultRuntime>,
     master_password: String,
     legacy_passwords: Vec<VaultPassword>,
-) -> Result<Vec<VaultPassword>, String> {
+) -> Result<VaultPayload, String> {
+    mutate(&app, || {
     if vault_exists(&app)? {
         return Err("password vault already exists".to_string());
     }
     let (vault, key) = create_vault_file(&master_password, legacy_passwords.clone())?;
+    local_vault_unlock::remove(&vault_local_unlock_path(&app)?)?;
     write_vault_file(&app, &vault)?;
     let verified = decrypt_payload(&read_vault_file(&app)?, &key)?;
     if verified.passwords != legacy_passwords {
         return Err("password vault verification failed".to_string());
     }
     store_vault_key(&state, key)?;
-    Ok(verified.passwords)
+    Ok(verified)
+    })
 }
 
 #[tauri::command]
@@ -805,13 +935,15 @@ fn vault_unlock(
     app: tauri::AppHandle,
     state: tauri::State<VaultRuntime>,
     master_password: String,
-) -> Result<Vec<VaultPassword>, String> {
+) -> Result<VaultPayload, String> {
+    mutate(&app, || {
     let vault = read_vault_file(&app)?;
     let salt = STANDARD.decode(&vault.salt).map_err(|_| "password vault is invalid".to_string())?;
     let key = derive_vault_key(&master_password, &salt, &vault.kdf)?;
     let payload = decrypt_payload(&vault, &key)?;
     store_vault_key(&state, key)?;
-    Ok(payload.passwords)
+    Ok(payload)
+    })
 }
 
 #[tauri::command]
@@ -819,15 +951,21 @@ fn vault_replace_passwords(
     app: tauri::AppHandle,
     state: tauri::State<VaultRuntime>,
     passwords: Vec<VaultPassword>,
+    collections: Option<Vec<VaultCollection>>,
 ) -> Result<(), String> {
-    validate_passwords(&passwords)?;
+    mutate(&app, || {
     let key = active_vault_key(&state)?;
     let current = read_vault_file(&app)?;
-    let _ = decrypt_payload(&current, &key)?;
+    let existing = decrypt_payload(&current, &key)?;
+    if collections.is_none() && !existing.collections.is_empty() {
+        return Err("A complete password vault snapshot is required".to_string());
+    }
     let salt = STANDARD.decode(&current.salt).map_err(|_| "password vault is invalid".to_string())?;
-    let payload = VaultPayload { version: VAULT_VERSION, passwords };
+    let payload = VaultPayload { version: VAULT_VERSION, passwords, collections: collections.unwrap_or_default() };
+    validate_vault_payload(&payload)?;
     let encrypted = encrypt_payload(&payload, &key, current.kdf, &salt)?;
     write_vault_file(&app, &encrypted)
+    })
 }
 
 #[tauri::command]
@@ -837,16 +975,19 @@ fn vault_change_master_password(
     current_master_password: String,
     next_master_password: String,
 ) -> Result<(), String> {
+    mutate(&app, || {
     let current = read_vault_file(&app)?;
     let (rotated, next_key) = rotate_vault_master_password(
         &current,
         &current_master_password,
         &next_master_password,
     )?;
+    local_vault_unlock::remove(&vault_local_unlock_path(&app)?)?;
     write_vault_file(&app, &rotated)?;
     let verified = read_vault_file(&app)?;
     decrypt_payload(&verified, &next_key)?;
     store_vault_key(&state, next_key)
+    })
 }
 
 #[tauri::command]
@@ -855,11 +996,13 @@ fn vault_export_encrypted_backup(
     state: tauri::State<VaultRuntime>,
     destination_path: String,
 ) -> Result<VaultBackupStatus, String> {
+    mutate(&app, || {
     let key = active_vault_key(&state)?;
     let vault = read_vault_file(&app)?;
     let payload = decrypt_payload(&vault, &key)?;
     export_backup_file(&destination_path, &vault)?;
     Ok(VaultBackupStatus { passwords: payload.passwords.len() })
+    })
 }
 
 #[tauri::command]
@@ -869,7 +1012,8 @@ fn vault_restore_encrypted_backup(
     source_path: String,
     master_password: String,
     replace_existing: bool,
-) -> Result<Vec<VaultPassword>, String> {
+) -> Result<VaultPayload, String> {
+    mutate(&app, || {
     if vault_exists(&app)? && !replace_existing {
         return Err("password vault already exists; explicit replacement is required".to_string());
     }
@@ -877,13 +1021,17 @@ fn vault_restore_encrypted_backup(
     let salt = STANDARD.decode(&backup.salt).map_err(|_| "backup file is invalid".to_string())?;
     let key = derive_vault_key(&master_password, &salt, &backup.kdf)?;
     let payload = decrypt_payload(&backup, &key)?;
-    write_vault_file(&app, &backup)?;
+    let upgraded = VaultPayload { version: VAULT_VERSION, ..payload.clone() };
+    let upgraded_file = encrypt_payload(&upgraded, &key, backup.kdf, &salt)?;
+    local_vault_unlock::remove(&vault_local_unlock_path(&app)?)?;
+    write_vault_file(&app, &upgraded_file)?;
     let verified = decrypt_payload(&read_vault_file(&app)?, &key)?;
-    if verified.passwords != payload.passwords {
+    if verified != upgraded {
         return Err("encrypted backup verification failed".to_string());
     }
     store_vault_key(&state, key)?;
-    Ok(verified.passwords)
+    Ok(verified)
+    })
 }
 
 #[tauri::command]
@@ -898,15 +1046,18 @@ fn vault_lock(state: tauri::State<VaultRuntime>) -> Result<(), String> {
 
 #[tauri::command]
 fn vault_delete(app: tauri::AppHandle, state: tauri::State<VaultRuntime>) -> Result<(), String> {
+    mutate(&app, || {
+    local_vault_unlock::remove(&vault_local_unlock_path(&app)?)?;
     vault_lock(state)?;
     let path = vault_path(&app)?;
     let backup = vault_backup_path(&path);
-    for candidate in [path, backup] {
+    for candidate in [path.clone(), backup, path.with_extension("tmp")] {
         if candidate.exists() {
             std::fs::remove_file(candidate).map_err(|_| "could not remove password vault".to_string())?;
         }
     }
     Ok(())
+    })
 }
 
 #[tauri::command]
@@ -924,7 +1075,7 @@ fn clipboard_store_load(app: tauri::AppHandle) -> Result<ClipboardStore, String>
 
 #[tauri::command]
 fn clipboard_store_replace(app: tauri::AppHandle, store: ClipboardStore) -> Result<(), String> {
-    write_clipboard_store(&app, &store)
+    mutate(&app, || write_clipboard_store(&app, &store))
 }
 
 #[tauri::command]
@@ -934,6 +1085,7 @@ fn clipboard_store_migrate_legacy(
     legacy_categories: Vec<String>,
     preferences: Option<ClipboardPreferences>,
 ) -> Result<ClipboardStore, String> {
+    mutate(&app, || {
     let path = clipboard_store_path(&app)?;
     if path.exists() || path.with_extension("bak").exists() {
         return read_clipboard_store(&app);
@@ -941,10 +1093,12 @@ fn clipboard_store_migrate_legacy(
     let store = migrate_legacy_clipboard_store(legacy_records, legacy_categories, preferences)?;
     write_clipboard_store(&app, &store)?;
     read_clipboard_store(&app)
+    })
 }
 
 #[tauri::command]
 fn clipboard_store_delete(app: tauri::AppHandle) -> Result<(), String> {
+    mutate(&app, || {
     let path = clipboard_store_path(&app)?;
     for candidate in [path.clone(), path.with_extension("bak"), path.with_extension("tmp")] {
         if candidate.exists() {
@@ -952,6 +1106,7 @@ fn clipboard_store_delete(app: tauri::AppHandle) -> Result<(), String> {
         }
     }
     Ok(())
+    })
 }
 
 #[tauri::command]
@@ -970,14 +1125,15 @@ fn update_global_shortcut(
     state: tauri::State<ShortcutRuntime>,
     shortcut: String,
 ) -> Result<ShortcutStatus, String> {
+    mutate(&app, || update_shortcut_inner(&app, &state, shortcut))
+}
+
+fn update_shortcut_inner(app: &tauri::AppHandle, state: &ShortcutRuntime, shortcut: String) -> Result<ShortcutStatus, String> {
     let next = normalize_shortcut(&shortcut)?;
     let mut active = state
         .shortcut
         .lock()
         .map_err(|_| "shortcut settings are unavailable".to_string())?;
-    if *active == next {
-        return Ok(ShortcutStatus { shortcut: next });
-    }
     let previous = active.clone();
     let previous_shortcut = previous
         .parse::<Shortcut>()
@@ -985,21 +1141,52 @@ fn update_global_shortcut(
     let next_shortcut = next
         .parse::<Shortcut>()
         .map_err(|_| "shortcut is not available on this system".to_string())?;
+    let was_registered = app.global_shortcut().is_registered(previous_shortcut);
+    if previous_shortcut == next_shortcut && was_registered {
+        if previous != next { write_shortcut_preference(app, &next)?; }
+        *active = next.clone();
+        return Ok(ShortcutStatus { shortcut: next });
+    }
 
     app.global_shortcut()
         .register(next_shortcut.clone())
-        .map_err(|_| "that shortcut is already in use".to_string())?;
-    if app.global_shortcut().unregister(previous_shortcut).is_err() {
+        .map_err(|error| format!("Could not register {next}: {error}"))?;
+    if was_registered && app.global_shortcut().unregister(previous_shortcut).is_err() {
         let _ = app.global_shortcut().unregister(next_shortcut);
         return Err("could not replace the current shortcut".to_string());
     }
     if write_shortcut_preference(&app, &next).is_err() {
-        let _ = app.global_shortcut().register(previous.parse::<Shortcut>().map_err(|_| "could not restore the current shortcut".to_string())?);
+        if was_registered { let _ = app.global_shortcut().register(previous_shortcut); }
         let _ = app.global_shortcut().unregister(next_shortcut);
         return Err("could not save shortcut preference".to_string());
     }
     *active = next.clone();
     Ok(ShortcutStatus { shortcut: next })
+}
+
+fn fit_initial_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let Some(window) = app.get_webview_window("main") else { return Ok(()) };
+    let Some(monitor) = window.current_monitor()?.or(window.primary_monitor()?) else { return Ok(()) };
+    let area = monitor.work_area();
+    let inner = window.inner_size()?;
+    let outer = window.outer_size()?;
+    let frame_width = outer.width.saturating_sub(inner.width);
+    let frame_height = outer.height.saturating_sub(inner.height);
+    // 使用物理像素与工作区，兼容系统缩放并避开任务栏。
+    let size = tauri::PhysicalSize::new(
+        inner.width.min(area.size.width.saturating_sub(frame_width)).max(1),
+        inner.height.min(area.size.height.saturating_sub(frame_height)).max(1),
+    );
+    if size != inner { window.set_size(size)?; }
+    let position = window.outer_position()?;
+    let max_x = area.position.x + area.size.width.saturating_sub(size.width + frame_width) as i32;
+    let max_y = area.position.y + area.size.height.saturating_sub(size.height + frame_height) as i32;
+    let fitted = tauri::PhysicalPosition::new(
+        position.x.clamp(area.position.x, max_x),
+        position.y.clamp(area.position.y, max_y),
+    );
+    if position != fitted { window.set_position(fitted)?; }
+    Ok(())
 }
 
 fn toggle_main_window(app: &tauri::AppHandle) {
@@ -1026,6 +1213,10 @@ fn set_clipboard_text(text: String) -> Result<(), String> {
 #[tauri::command]
 fn get_clipboard_data() -> Result<Option<(String, String)>, String> {
     let ctx = ClipboardContext::new().map_err(|e| e.to_string())?;
+    read_clipboard_data(&ctx)
+}
+
+fn read_clipboard_data(ctx: &ClipboardContext) -> Result<Option<(String, String)>, String> {
 
     if ctx.has(ContentFormat::Files) {
         if let Ok(files) = ctx.get_files() {
@@ -1079,6 +1270,35 @@ fn get_clipboard_data() -> Result<Option<(String, String)>, String> {
 }
 
 #[tauri::command]
+fn get_clipboard_snapshot() -> Result<Option<ClipboardSnapshot>, String> {
+    let ctx = ClipboardContext::new().map_err(|e| e.to_string())?;
+    let rich_text = if ctx.has(ContentFormat::Html) {
+        ctx.get_text().ok().filter(|text| !text.is_empty()).map(|text| ("text".to_string(), text))
+    } else { None };
+    let data = match rich_text { Some(data) => Some(data), None => read_clipboard_data(&ctx)? };
+    let Some((kind, content)) = data else { return Ok(None) };
+    let mut snapshot = ClipboardSnapshot { kind, content, html: None, warning: None };
+    if snapshot.kind == "text" && ctx.has(ContentFormat::Html) {
+        match ctx.get_html() {
+            Ok(html) if html.len() <= MAX_HTML_BYTES => snapshot.html = Some(html),
+            Ok(_) => snapshot.warning = Some("HTML exceeds 1 MiB; only plain text was saved.".to_string()),
+            Err(_) => snapshot.warning = Some("HTML could not be read; only plain text was saved.".to_string()),
+        }
+        if ctx.get_text().ok().as_deref() != Some(snapshot.content.as_str()) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(snapshot))
+}
+
+#[tauri::command]
+fn set_clipboard_rich_text(text: String, html: String) -> Result<(), String> {
+    if html.len() > MAX_HTML_BYTES { return Err("HTML exceeds 1 MiB".to_string()) }
+    let ctx = ClipboardContext::new().map_err(|e| e.to_string())?;
+    ctx.set(vec![ClipboardContent::Text(text), ClipboardContent::Html(html)]).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn set_clipboard_image(base64: String) -> Result<(), String> {
     let estimated_len = estimate_base64_decoded_len(&base64)?;
     if estimated_len > MAX_IMAGE_DATA_BYTES {
@@ -1110,6 +1330,7 @@ fn set_clipboard_image_from_path(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn persist_history_image(app: tauri::AppHandle, base64: String) -> Result<String, String> {
+    mutate(&app, || {
     let estimated_len = estimate_base64_decoded_len(&base64)?;
     if estimated_len > MAX_IMAGE_DATA_BYTES {
         return Err(format!(
@@ -1132,25 +1353,29 @@ fn persist_history_image(app: tauri::AppHandle, base64: String) -> Result<String
     std::fs::write(&file_path, image_bytes).map_err(|e| e.to_string())?;
     cleanup_history_image_dir(&dir)?;
     Ok(file_path.to_string_lossy().to_string())
+    })
 }
 
 #[tauri::command]
 fn delete_history_images(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
+    mutate(&app, || {
     let dir = history_image_dir(&app)?;
     for raw in paths {
         let Some(path) = normalize_history_image_path(&raw) else {
             continue;
         };
         if path.exists() && path_is_within_dir(&path, &dir) {
-            let _ = std::fs::remove_file(path);
+            std::fs::remove_file(path).map_err(|e| e.to_string())?;
         }
     }
     cleanup_history_image_dir(&dir)?;
     Ok(())
+    })
 }
 
 #[tauri::command]
 fn clear_history_images(app: tauri::AppHandle) -> Result<(), String> {
+    mutate(&app, || {
     let dir = history_image_dir(&app)?;
     for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
@@ -1159,6 +1384,7 @@ fn clear_history_images(app: tauri::AppHandle) -> Result<(), String> {
         }
     }
     Ok(())
+    })
 }
 
 #[tauri::command]
@@ -1189,15 +1415,89 @@ fn autostart_status(app: tauri::AppHandle) -> Result<bool, String> {
 
 #[tauri::command]
 fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    mutate(&app, || {
     if enabled { app.autolaunch().enable() } else { app.autolaunch().disable() }
         .map_err(|e| e.to_string())?;
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+fn app_reset_status(app: tauri::AppHandle) -> Result<bool, String> {
+    Ok(reset_marker_path(&app)?.exists())
+}
+
+fn write_reset_stage(path: &Path, stage: &str) -> Result<(), String> {
+    let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    file.write_all(stage.as_bytes()).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reset_app_data(app: tauri::AppHandle, confirmation: String) -> Result<ClipboardStore, String> {
+    if confirmation != "DELETE" { return Err("Type DELETE to confirm".to_string()) }
+    let mutation = app.state::<MutationRuntime>();
+    let _guard = mutation.0.lock().map_err(|_| "application storage is busy".to_string())?;
+    let shortcut = app.state::<ShortcutRuntime>();
+    let default = DEFAULT_SHORTCUT.parse::<Shortcut>().map_err(|e| e.to_string())?;
+    // 先确认默认快捷键可用，再标记并删除应用管理的数据。
+    if !app.global_shortcut().is_registered(default.clone()) {
+        app.global_shortcut().register(default.clone()).map_err(|_| "Alt+C is in use; no app data was deleted".to_string())?;
+    }
+    let marker = reset_marker_path(&app)?;
+    std::fs::create_dir_all(marker.parent().ok_or("Invalid app data directory")?).map_err(|e| e.to_string())?;
+    write_reset_stage(&marker, "clearing")?;
+    app.autolaunch().disable().map_err(|e| e.to_string())?;
+    {
+        let mut active = shortcut.shortcut.lock().map_err(|_| "shortcut settings are unavailable".to_string())?;
+        if *active != DEFAULT_SHORTCUT {
+            if let Ok(previous) = active.parse::<Shortcut>() { app.global_shortcut().unregister(previous).map_err(|e| e.to_string())?; }
+        }
+        *active = DEFAULT_SHORTCUT.to_string();
+    }
+    vault_lock(app.state::<VaultRuntime>())?;
+    for path in [clipboard_store_path(&app)?, vault_path(&app)?, vault_local_unlock_path(&app)?, shortcut_path(&app)?] {
+        for candidate in [path.clone(), path.with_extension("bak"), path.with_extension("tmp")] {
+            match std::fs::remove_file(&candidate) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(format!("Reset could not remove {}: {error}", candidate.file_name().unwrap_or_default().to_string_lossy())),
+            }
+        }
+    }
+    let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    let images = cache.join(IMAGE_HISTORY_DIR_NAME);
+    if images.exists() {
+        if !path_is_within_dir(&images, &cache) { return Err("Image cache is outside app storage".to_string()) }
+        for entry in std::fs::read_dir(&images).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.file_type().map_err(|e| e.to_string())?.is_dir() { return Err("Unexpected directory in image cache; reset paused".to_string()) }
+            std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+        }
+    }
+    let store = default_clipboard_store();
+    write_clipboard_store(&app, &store)?;
+    write_shortcut_preference(&app, DEFAULT_SHORTCUT)?;
+    write_reset_stage(&marker, "ready")?;
+    Ok(store)
+}
+
+#[tauri::command]
+fn complete_app_reset(app: tauri::AppHandle) -> Result<(), String> {
+    let mutation = app.state::<MutationRuntime>();
+    let _guard = mutation.0.lock().map_err(|_| "application storage is busy".to_string())?;
+    let marker = reset_marker_path(&app)?;
+    if std::fs::read_to_string(&marker).map_err(|e| e.to_string())? != "ready" {
+        return Err("App reset is incomplete; retry reset".to_string());
+    }
+    std::fs::remove_file(marker).map_err(|e| e.to_string())
 }
 
 fn main() {
     tauri::Builder::default()
         .manage(VaultRuntime::default())
         .manage(ShortcutRuntime::default())
+        .manage(MutationRuntime::default())
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1207,6 +1507,9 @@ fn main() {
             }
         })
         .setup(|app| {
+            if let Err(error) = fit_initial_window(app.handle()) {
+                eprintln!("Could not fit initial window to monitor: {error}");
+            }
             // ==========================================
             // 1. 初始化并开启【开机自启动】
             // ==========================================
@@ -1244,7 +1547,9 @@ fn main() {
                     })
                     .build(),
             )?;
-            app.global_shortcut().register(initial_shortcut)?;
+            if let Err(error) = app.global_shortcut().register(initial_shortcut) {
+                if !reset_marker_path(app.handle())?.exists() { return Err(error.into()) }
+            }
 
             // ==========================================
             // 3. 配置【右下角系统托盘】
@@ -1279,12 +1584,19 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             set_clipboard_text,
             get_clipboard_data,
+            get_clipboard_snapshot,
+            set_clipboard_rich_text,
+            app_reset_status,
+            reset_app_data,
+            complete_app_reset,
             set_clipboard_image,
             set_clipboard_image_from_path,
             persist_history_image,
             delete_history_images,
             clear_history_images,
             vault_status,
+            vault_set_require_password,
+            vault_auto_unlock,
             vault_setup,
             vault_unlock,
             vault_replace_passwords,
@@ -1318,12 +1630,71 @@ mod tests {
             title: "Example".to_string(),
             username: "user@example.com".to_string(),
             password: "correct-horse-battery-staple".to_string(),
+            collection_id: None,
         }
     }
 
     #[test]
+    fn master_password_length_boundaries() {
+        for length in [0, 7, 17] {
+            assert!(create_vault_file(&"a".repeat(length), vec![]).is_err());
+        }
+        for length in [8, 16] {
+            assert!(validate_master_password(&"a".repeat(length)).is_ok());
+            assert!(validate_master_password(&"密".repeat(length)).is_ok());
+            assert!(validate_master_password(&"🔒".repeat(length)).is_ok());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vault_access_requires_verification_and_preserves_encrypted_data() {
+        let (vault, key) = create_vault_file("Test-master-1234", vec![sample_password()]).unwrap();
+        let original = serde_json::to_vec(&vault).unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("clipboard-access-policy-test-{stamp}.bin"));
+        let context = format!("synthetic:{}", vault.salt);
+        assert!(configure_vault_access(&path, &vault, "incorrect", false, context.as_bytes()).is_err());
+        assert!(!path.exists());
+        configure_vault_access(&path, &vault, "Test-master-1234", false, context.as_bytes()).unwrap();
+        let cached = local_vault_unlock::read(&path, context.as_bytes()).unwrap();
+        assert_eq!(*cached, key);
+        assert_eq!(decrypt_payload(&vault, &cached).unwrap().passwords.len(), 1);
+        assert!(configure_vault_access(&path, &vault, "incorrect", true, context.as_bytes()).is_err());
+        assert!(path.exists());
+        configure_vault_access(&path, &vault, "Test-master-1234", true, context.as_bytes()).unwrap();
+        assert!(!path.exists());
+        assert!(original == serde_json::to_vec(&vault).unwrap());
+        assert!(local_vault_unlock::read(&path, context.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn master_password_boundaries_round_trip() {
+        let (vault, key) = create_vault_file("12345678", vec![sample_password()]).unwrap();
+        assert_eq!(decrypt_payload(&vault, &key).unwrap().passwords.len(), 1);
+        let (rotated, next_key) = rotate_vault_master_password(&vault, "12345678", "1234567890123456").unwrap();
+        assert_eq!(decrypt_payload(&rotated, &next_key).unwrap().passwords.len(), 1);
+        assert!(rotate_vault_master_password(&vault, "12345678", "12345678901234567").is_err());
+    }
+
+    #[test]
+    fn legacy_long_master_password_still_unlocks() {
+        let (template, _) = create_vault_file("Test-master-1234", vec![]).unwrap();
+        let salt = STANDARD.decode(&template.salt).unwrap();
+        let legacy_password = "legacy master password longer than sixteen";
+        let legacy_key = derive_vault_key(legacy_password, &salt, &template.kdf).unwrap();
+        let payload = VaultPayload { version: VAULT_VERSION, passwords: vec![sample_password()], collections: vec![] };
+        let vault = encrypt_payload(&payload, &legacy_key, template.kdf, &salt).unwrap();
+        let key = derive_vault_key(legacy_password, &salt, &vault.kdf).unwrap();
+        assert_eq!(decrypt_payload(&vault, &key).unwrap().passwords.len(), 1);
+        let (rotated, next_key) = rotate_vault_master_password(&vault, legacy_password, "New-pass-123").unwrap();
+        assert_eq!(decrypt_payload(&rotated, &next_key).unwrap().passwords.len(), 1);
+        assert!(create_vault_file(legacy_password, vec![]).is_err());
+    }
+
+    #[test]
     fn encrypted_vault_round_trip_preserves_passwords() {
-        let (vault, key) = create_vault_file("a long enough master password", vec![sample_password()])
+        let (vault, key) = create_vault_file("Test-master-1234", vec![sample_password()])
             .expect("vault should be created");
         let payload = decrypt_payload(&vault, &key).expect("vault should decrypt");
 
@@ -1333,7 +1704,7 @@ mod tests {
 
     #[test]
     fn encrypted_vault_rejects_another_master_password() {
-        let (vault, _) = create_vault_file("a long enough master password", vec![sample_password()])
+        let (vault, _) = create_vault_file("Test-master-1234", vec![sample_password()])
             .expect("vault should be created");
         let salt = STANDARD.decode(&vault.salt).expect("salt should decode");
         let wrong_key = derive_vault_key("another long master password", &salt, &vault.kdf)
@@ -1345,22 +1716,26 @@ mod tests {
     #[test]
     fn shortcut_normalization_requires_a_safe_modifier() {
         assert_eq!(normalize_shortcut("ctrl + shift + c").as_deref(), Ok("Ctrl+Shift+C"));
+        assert_eq!(normalize_shortcut("shift + alt + ctrl + v").as_deref(), Ok("Ctrl+Alt+Shift+V"));
+        assert_eq!(normalize_shortcut("alt + control + 9").as_deref(), Ok("Ctrl+Alt+9"));
+        assert!(normalize_shortcut("Ctrl++V").is_err());
+        assert!(normalize_shortcut("Ctrl+Ctrl+V").is_err());
         assert!(normalize_shortcut("Shift+C").is_err());
         assert!(normalize_shortcut("Alt+F1").is_err());
     }
 
     #[test]
     fn master_password_rotation_invalidates_the_previous_password() {
-        let (vault, _) = create_vault_file("a long enough master password", vec![sample_password()])
+        let (vault, _) = create_vault_file("Test-master-1234", vec![sample_password()])
             .expect("vault should be created");
         let (rotated, next_key) = rotate_vault_master_password(
             &vault,
-            "a long enough master password",
-            "a different long master password",
+            "Test-master-1234",
+            "Next-master-5678",
         )
         .expect("vault should rotate");
         let salt = STANDARD.decode(&rotated.salt).expect("salt should decode");
-        let old_key = derive_vault_key("a long enough master password", &salt, &rotated.kdf)
+        let old_key = derive_vault_key("Test-master-1234", &salt, &rotated.kdf)
             .expect("old key derivation should work");
 
         assert!(decrypt_payload(&rotated, &old_key).is_err());
@@ -1369,7 +1744,7 @@ mod tests {
 
     #[test]
     fn encrypted_backup_never_contains_the_plaintext_password() {
-        let (vault, _) = create_vault_file("a long enough master password", vec![sample_password()])
+        let (vault, _) = create_vault_file("Test-master-1234", vec![sample_password()])
             .expect("vault should be created");
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)

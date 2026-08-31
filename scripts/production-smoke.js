@@ -8,7 +8,7 @@ async (page) => {
     check('production native startup and viewport', await page.evaluate(() => location.hostname === 'tauri.localhost' && innerWidth === 1586 && innerHeight === 992 && !document.querySelector('.reference-mode')));
     const initial = await invoke('clipboard_store_load');
     check('real history loaded without storage error', initial.records.length > 0 && await page.locator('.error-toast').count() === 0);
-    for (const name of ['Images', 'Passwords', 'Settings', 'Recent']) {
+    for (const name of ['Images', 'Passwords', 'Settings', 'Characters']) {
       await page.locator('.ref-primary-nav').getByRole('button', { name, exact: true }).click();
       check(`production page ${name}`, await page.locator('.ref-primary-nav button.active').innerText() === name);
     }

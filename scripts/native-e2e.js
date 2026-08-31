@@ -17,7 +17,7 @@ async (page) => {
       await window.__TAURI_INTERNALS__.invoke('clipboard_store_replace', { store });
     });
     await page.reload();
-    await page.getByText('No clips yet. Copy text or an image to get started.').waitFor({ timeout: 5000 });
+    await page.getByText('No text clips yet. Copy text to get started.').waitFor({ timeout: 5000 });
     check('empty history state', true);
     await nav('Settings');
     await page.getByRole('button', { name: 'Toggle clipboard capture', exact: true }).click();
@@ -25,7 +25,7 @@ async (page) => {
     check('capture saved on', (await invoke('clipboard_store_load')).preferences.captureEnabled);
     await invoke('set_clipboard_text', { text: 'PHASE2-QA live text one' });
     await waitRecord('PHASE2-QA live text one');
-    await nav('Recent');
+    await nav('Characters');
     await page.locator('.clip-row').filter({ hasText: 'PHASE2-QA live text one' }).click();
     check('live clipboard text captured and selected', await page.locator('.clip-content').innerText() === 'PHASE2-QA live text one');
     await page.getByRole('button', { name: 'Copy all', exact: true }).click();
@@ -66,10 +66,10 @@ async (page) => {
     await page.getByRole('button', { name: 'Toggle launch at startup' }).click();
     check('autostart restored', await invoke('autostart_status') === startupBefore);
     await page.locator('.shortcut-control').click();
-    await page.locator('.shortcut-editor input').fill('Alt+V');
+    await page.locator('.shortcut-editor input').press('Alt+V');
     await page.getByRole('button', { name: 'Apply', exact: true }).click();
     check('global shortcut saved natively', (await invoke('shortcut_status')).shortcut === 'Alt+V');
-    await nav('Recent');
+    await nav('Characters');
     await page.screenshot({ path: 'design-qa/final/native-recent.png', type: 'png', scale: 'css' });
   } catch (error) { results.push({ name: 'stopped', pass: false, error: error.message }); }
   await page.evaluate(results => localStorage.setItem('phase2-test-results', JSON.stringify(results)), results);

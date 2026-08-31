@@ -2,6 +2,7 @@
   import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import ClipboardApp from '$lib/ClipboardApp.svelte';
+  import { sanitizeClipboardHtml, textSignature, toClipboardHtml } from '$lib/clipboard-format';
 
   const DEFAULT_CATEGORY = '全部';
   const HISTORY_KEY = 'clip_v5_split';
@@ -11,7 +12,7 @@
   const PREFERENCES_KEY = 'clip_v6_preferences';
   const RECOVERY_FLAG_KEY = 'clip_v5_recovery_imported';
   const PASSWORD_EXPORT_FORMAT = 'my-clipboard-passwords';
-  const PASSWORD_EXPORT_VERSION = 1;
+  const PASSWORD_EXPORT_VERSION = 2;
   const MAX_PASSWORD_IMPORT_BYTES = 1024 * 1024;
   const MAX_IMPORTED_PASSWORDS = 1000;
 
@@ -24,6 +25,7 @@
    * @property {string=} category
    * @property {boolean=} restored
    * @property {boolean=} isPinned
+   * @property {string=} html
    */
 
   /**
@@ -33,6 +35,7 @@
    * @property {string} username
    * @property {string} password
    * @property {boolean} showPass
+   * @property {string | null=} collectionId
    */
 
   let activeTab = 'recent';
@@ -53,6 +56,12 @@
   let autostartEnabled = false;
   let autostartError = '';
   let storeWrites = Promise.resolve(true);
+  let vaultWrites = Promise.resolve(true);
+  let vaultSaving = false;
+  let copyInFlight = 0;
+  let resetPending = false;
+  let resetEpoch = 0;
+  let startupBlocked = false;
   let shortcutValue = 'Alt+C';
   let shortcutBusy = false;
   let shortcutError = '';
@@ -64,8 +73,16 @@
   let pwdSearchQuery = '';
   /** @type {PasswordItem[]} */
   let passwords = [];
+  /** @type {Array<{id: string, name: string}>} */
+  let vaultCollections = [];
+  let activePasswordCollection = '';
   let vaultExists = false;
   let vaultUnlocked = false;
+  let vaultRequirePassword = true;
+  let vaultAutoUnlockAvailable = false;
+  let vaultStatusReady = false;
+  let vaultAutoUnlockFailed = false;
+  let vaultAccessError = '';
   let vaultBusy = false;
   let vaultError = '';
   let masterPassword = '';
@@ -136,10 +153,11 @@
   /**
    * @param {string} type
    * @param {string} content
+   * @param {string=} html
    */
-  function clipboardSignature(type, content) {
+  function clipboardSignature(type, content, html) {
     if (type === 'image') return imageClipboardSignature(content);
-    return content || '';
+    return textSignature(content || '', html);
   }
 
   /** @param {unknown} content */
@@ -198,6 +216,7 @@
 
   /** @param {HistoryItem[]} newArray */
   function updateAndSaveHistory(newArray) {
+    if (clearDataBusy || resetPending) return;
     const previousHistory = history;
     const EXPIRATION_MS = retentionHours * 60 * 60 * 1000;
     const now = Date.now();
@@ -239,7 +258,7 @@
   }
 
   function persistClipboardStore() {
-    if (!storeReady) return Promise.resolve(false);
+    if (!storeReady || clearDataBusy || resetPending) return Promise.resolve(false);
       /** @type {Map<string, string>} */
       const catMap = new Map();
       catMap.set(DEFAULT_CATEGORY, "all");
@@ -255,6 +274,7 @@
       const records = history.map((item) => ({
         type: item.type,
         content: item.content,
+        html: item.html,
         id: item.id,
         timestamp: item.timestamp,
         categoryId: catMap.get(item.category || DEFAULT_CATEGORY) || "all",
@@ -293,36 +313,116 @@
   }
 
   async function persistVaultPasswords() {
-    try {
-      await invoke('vault_replace_passwords', {
-        passwords: passwords.map(({ id, title, username, password }) => ({ id, title, username, password }))
-      });
-      vaultError = '';
-      return true;
-    } catch (error) {
-      vaultError = `Could not save password vault: ${String(error)}`;
-      return false;
-    }
+    return saveVaultSnapshot(passwords, vaultCollections);
   }
 
-  /** @param {Array<{id: number, title: string, username: string, password: string}>} records */
-  function loadVaultPasswords(records) {
-    passwords = records.map((item) => ({ ...item, showPass: false }));
+  /** @param {PasswordItem[]} nextPasswords @param {Array<{id: string, name: string}>} nextCollections */
+  function saveVaultSnapshot(nextPasswords, nextCollections) {
+    if (!vaultUnlocked || clearDataBusy || resetPending) return Promise.resolve(false);
+    const snapshot = {
+      passwords: nextPasswords.map(({ id, title, username, password, collectionId }) => ({ id, title, username, password, collectionId: collectionId || null })),
+      collections: nextCollections.map(item => ({ ...item }))
+    };
+    vaultSaving = true;
+    vaultWrites = vaultWrites.then(async () => {
+      try {
+        await invoke('vault_replace_passwords', snapshot);
+        passwords = snapshot.passwords.map(item => ({ ...item, showPass: false }));
+        vaultCollections = snapshot.collections;
+        vaultError = '';
+        return true;
+      } catch (error) {
+        vaultError = `Could not save password vault: ${String(error)}`;
+        return false;
+      }
+    });
+    const operation = vaultWrites;
+    void operation.finally(() => { if (vaultWrites === operation) vaultSaving = false; });
+    return operation;
+  }
+
+  /** @param {{passwords: Array<{id: number, title: string, username: string, password: string, collectionId?: string | null}>, collections: Array<{id: string, name: string}>}} snapshot */
+  function loadVaultPasswords(snapshot) {
+    passwords = snapshot.passwords.map(item => ({ ...item, showPass: false }));
+    vaultCollections = snapshot.collections || [];
+  }
+
+  function clearVaultMemory() {
+    passwords = [];
+    vaultCollections = [];
+    activePasswordCollection = '';
+    pwdSearchQuery = '';
+    masterPassword = masterPasswordConfirm = unlockPassword = '';
+    newPwdTitle = newPwdUser = newPwdPass = '';
+    cancelEditPassword();
   }
 
   async function loadVaultStatus() {
     try {
       const status = await invoke('vault_status');
       vaultExists = status.exists;
+      vaultRequirePassword = status.requirePassword !== false;
+      vaultAutoUnlockAvailable = status.autoUnlockAvailable === true;
       if (status.unlocked) await invoke('vault_lock');
       vaultUnlocked = false;
+      vaultStatusReady = true;
     } catch {
       vaultError = 'Secure password vault is unavailable.';
     }
   }
 
-  async function setupVault() {
+  async function autoUnlockVault() {
+    if (vaultBusy || clearDataBusy || resetPending) return;
+    const epoch = resetEpoch;
+    vaultBusy = true;
     vaultError = '';
+    try {
+      const snapshot = await invoke('vault_auto_unlock');
+      if (epoch !== resetEpoch || clearDataBusy || resetPending) return;
+      loadVaultPasswords(snapshot);
+      vaultUnlocked = true;
+      vaultLastActivity = Date.now();
+    } catch (error) {
+      if (epoch !== resetEpoch || clearDataBusy || resetPending) return;
+      vaultAutoUnlockFailed = true;
+      vaultError = `Automatic opening failed. Use your master password. ${String(error)}`;
+    } finally { vaultBusy = false; }
+  }
+
+  $: if (activeTab === 'passwords' && vaultStatusReady && vaultExists && !vaultRequirePassword && !vaultUnlocked && !vaultBusy && !vaultAutoUnlockFailed && !clearDataBusy && !resetPending) {
+    void autoUnlockVault();
+  }
+
+  /** @param {boolean} required @param {string} password */
+  async function setVaultRequirePassword(required, password) {
+    if (!vaultExists || vaultBusy || vaultSaving || clearDataBusy || resetPending) return false;
+    const epoch = resetEpoch;
+    vaultAccessError = '';
+    vaultBusy = true;
+    try {
+      if (!await vaultWrites) throw new Error('Save password changes before changing vault access.');
+      await invoke('vault_set_require_password', { requirePassword: required, masterPassword: password });
+      if (epoch !== resetEpoch || clearDataBusy || resetPending) return false;
+      vaultRequirePassword = required;
+      vaultAutoUnlockFailed = false;
+      vaultError = '';
+      if (required) { clearVaultMemory(); vaultUnlocked = false; }
+      triggerToast(required ? 'Password requirement enabled' : 'Password requirement disabled on this Windows account');
+      return true;
+    } catch (error) {
+      vaultAccessError = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally { vaultBusy = false; }
+  }
+
+  async function setupVault() {
+    if (vaultBusy || clearDataBusy || resetPending) return;
+    vaultError = '';
+    const length = Array.from(masterPassword).length;
+    if (length < 8 || length > 16) {
+      vaultError = 'Master password must contain 8-16 characters.';
+      return;
+    }
     if (masterPassword !== masterPasswordConfirm) {
       vaultError = 'The master passwords do not match.';
       return;
@@ -337,19 +437,22 @@
       loadVaultPasswords(records);
       localStorage.removeItem(PASSWORDS_KEY);
       vaultExists = true;
+      vaultRequirePassword = true;
+      vaultAutoUnlockFailed = false;
       vaultUnlocked = true;
       vaultLastActivity = Date.now();
       masterPassword = '';
       masterPasswordConfirm = '';
       triggerToast('Secure vault created');
     } catch (error) {
-      vaultError = error instanceof Error ? error.message : 'Could not create secure vault.';
+      vaultError = error instanceof Error ? error.message : typeof error === 'string' ? error : 'Could not create secure vault.';
     } finally {
       vaultBusy = false;
     }
   }
 
   async function unlockVault() {
+    if (vaultBusy || clearDataBusy || resetPending) return;
     vaultError = '';
     vaultBusy = true;
     try {
@@ -360,22 +463,24 @@
       vaultLastActivity = Date.now();
       triggerToast('Password vault unlocked');
     } catch (error) {
-      vaultError = error instanceof Error ? error.message : 'Could not unlock password vault.';
+      vaultError = error instanceof Error ? error.message : String(error);
     } finally {
       vaultBusy = false;
     }
   }
 
   async function lockVault() {
+    if (!vaultUnlocked || !vaultRequirePassword || vaultBusy || clearDataBusy || resetPending) return;
+    vaultBusy = true;
     try {
+      await vaultWrites;
       await invoke('vault_lock');
-      passwords = [];
-      pwdSearchQuery = '';
+      clearVaultMemory();
       vaultUnlocked = false;
       triggerToast('Password vault locked');
     } catch {
       triggerToast('Could not lock password vault');
-    }
+    } finally { vaultBusy = false; }
   }
 
   function noteVaultActivity() {
@@ -391,7 +496,7 @@
   }
 
   async function toggleCapture() {
-    if (!storeReady || settingsBusy) return;
+    if (!storeReady || settingsBusy || clearDataBusy || resetPending) return;
     settingsBusy = true;
     captureEnabled = !captureEnabled;
     if (await persistClipboardStore()) triggerToast(captureEnabled ? 'Clipboard capture resumed' : 'Clipboard capture paused');
@@ -400,7 +505,7 @@
   }
 
   async function saveRetention() {
-    if (!storeReady || settingsBusy) return;
+    if (!storeReady || settingsBusy || clearDataBusy || resetPending) return;
     if (!Number.isInteger(retentionHours) || retentionHours < 1 || retentionHours > 8760) {
       storeError = 'Retention must be between 1 and 8760 hours.';
       return;
@@ -411,6 +516,7 @@
   }
 
   async function toggleAutostart() {
+    if (settingsBusy || clearDataBusy || resetPending) return;
     autostartError = '';
     settingsBusy = true;
     try {
@@ -420,21 +526,25 @@
     } finally { settingsBusy = false; }
   }
 
-  async function updateShortcut() {
+  /** @param {string} nextShortcut */
+  async function updateShortcut(nextShortcut) {
+    if (shortcutBusy || clearDataBusy || resetPending) return false;
     shortcutBusy = true;
     shortcutError = '';
     try {
-      const status = await invoke('update_global_shortcut', { shortcut: shortcutValue });
+      const status = await invoke('update_global_shortcut', { shortcut: nextShortcut });
       shortcutValue = status.shortcut;
       triggerToast(`Shortcut set to ${shortcutValue}`);
+      return true;
     } catch (error) {
-      shortcutError = error instanceof Error ? error.message : 'Could not update shortcut';
+      shortcutError = error instanceof Error ? error.message : String(error);
       try {
         const status = await invoke('shortcut_status');
         shortcutValue = status.shortcut;
       } catch {
-        // keep the current visible value when native status is unavailable
+        // 查询失败时保留最后一次确认的快捷键。
       }
+      return false;
     } finally {
       shortcutBusy = false;
     }
@@ -449,6 +559,8 @@
   }
 
   async function clearAllAppData() {
+    if (clearDataBusy) return;
+    if (settingsBusy || shortcutBusy || vaultBusy || copyInFlight) { clearDataError = 'Wait for the current operation to finish, then retry Delete.'; return; }
     if (clearDataConfirmation !== 'DELETE') {
       clearDataError = 'Type DELETE to confirm.';
       return;
@@ -457,11 +569,11 @@
     clearDataError = '';
     const previousCapture = captureEnabled;
     captureEnabled = false;
+    resetEpoch++;
     try {
-      await storeWrites;
-      await invoke('clipboard_store_replace', { store: { version: 1, records: [], categories: [{ id: 'all', name: DEFAULT_CATEGORY }], preferences: { captureEnabled: true, retentionHours: 24, officialWebsite: 'https://www.gov.cn/' } } });
-      await invoke('vault_delete');
-      await cleanupImageFilesFromItems(history.filter((item) => item.type !== 'text'));
+      await Promise.all([storeWrites, vaultWrites]);
+      const defaults = await invoke('reset_app_data', { confirmation: 'DELETE' });
+      resetPending = true;
       localStorage.removeItem(HISTORY_KEY);
       localStorage.removeItem(LAST_DATA_KEY);
       localStorage.removeItem(PASSWORDS_KEY);
@@ -472,18 +584,36 @@
       categories = [DEFAULT_CATEGORY];
       activeCategory = DEFAULT_CATEGORY;
       selectedClipId = null;
-      lastData = '';
-      passwords = [];
+      const baseline = await invoke('get_clipboard_snapshot');
+      const safe = sanitizeClipboardHtml(baseline?.html);
+      lastData = baseline ? clipboardSignature(baseline.type, baseline.content, safe.html) : '';
+      localStorage.setItem(LAST_DATA_KEY, lastData);
+      clearVaultMemory();
       vaultExists = false;
       vaultUnlocked = false;
+      vaultRequirePassword = true;
+      vaultAutoUnlockFailed = false;
+      vaultAccessError = '';
+      retentionHours = defaults.preferences.retentionHours;
+      officialWebsite = defaults.preferences.officialWebsite;
+      shortcutValue = 'Alt+C';
+      autostartEnabled = false;
+      storeError = captureError = autostartError = shortcutError = vaultError = '';
+      searchQuery = '';
+      recentFilter = 'all';
+      await invoke('complete_app_reset');
+      resetPending = false;
+      storeReady = true;
       captureEnabled = true;
-      retentionHours = 24;
       showClearDataConfirm = false;
       clearDataConfirmation = '';
       triggerToast('All local app data cleared');
+      if (startupBlocked) window.location.reload();
     } catch (error) {
-      captureEnabled = previousCapture;
-      clearDataError = error instanceof Error ? error.message : 'Could not clear local data';
+      try { resetPending = await invoke('app_reset_status'); } catch { resetPending = true; }
+      captureEnabled = resetPending ? false : previousCapture;
+      if (resetPending) { clearVaultMemory(); vaultUnlocked = false; storeReady = false; }
+      clearDataError = `Reset incomplete: ${String(error)}. ${resetPending ? 'Other changes are blocked; retry Delete to finish.' : 'No app data was deleted.'}`;
     } finally {
       clearDataBusy = false;
     }
@@ -531,6 +661,16 @@
     const init = async () => {
       if (!isTauri()) return;
       if (disposed) return;
+      try {
+        resetPending = await invoke('app_reset_status');
+        if (resetPending) {
+          startupBlocked = true;
+          captureEnabled = false;
+          activeTab = 'settings';
+          clearDataError = 'An unfinished reset was found. Type DELETE and retry to finish; old data will not be imported.';
+          return;
+        }
+      } catch (error) { storeError = `Reset status could not be checked: ${String(error)}`; return; }
       await loadVaultStatus();
       if (disposed) return;
       // 原生写入成功前保留旧存储，避免迁移失败丢失数据。
@@ -546,9 +686,10 @@
           if (!categories.includes(DEFAULT_CATEGORY)) {
             categories = [DEFAULT_CATEGORY, ...categories];
           }
-          history = loadedStore.records.map(/** @param {{type: string, content: string, id: number, timestamp: string, categoryId: string, restored?: boolean, isPinned?: boolean}} r */ (r) => ({
+          history = loadedStore.records.map(/** @param {{type: string, content: string, html?: string, id: number, timestamp: string, categoryId: string, restored?: boolean, isPinned?: boolean}} r */ (r) => ({
             type: r.type,
             content: r.content,
+            html: sanitizeClipboardHtml(r.html).html,
             id: r.id,
             timestamp: r.timestamp,
             category: idToName.get(r.categoryId) || DEFAULT_CATEGORY,
@@ -685,7 +826,8 @@
 
       let polling = false;
       clipboardInterval = setInterval(async () => {
-        if (polling || clearDataBusy) return;
+        if (polling || clearDataBusy || resetPending || copyInFlight) return;
+        const epoch = resetEpoch;
         const now = Date.now();
         const EXPIRATION_MS = retentionHours * 60 * 60 * 1000;
         if (
@@ -704,12 +846,13 @@
         if (!captureEnabled) return;
         polling = true;
         try {
-          const data = await invoke('get_clipboard_data');
+          const data = await invoke('get_clipboard_snapshot');
           captureError = '';
-          if (disposed || !captureEnabled || clearDataBusy) return;
+          if (disposed || !captureEnabled || clearDataBusy || resetPending || copyInFlight || epoch !== resetEpoch) return;
           if (data) {
-            const [type, content] = data;
-            const signature = clipboardSignature(type, content);
+            const { type, content } = data;
+            const safe = sanitizeClipboardHtml(data.html);
+            const signature = clipboardSignature(type, content, safe.html);
             if (signature !== lastData) {
               if (isAppCopying && type === 'image') {
                 lastData = signature;
@@ -722,12 +865,14 @@
               if (type === 'image') {
                 storedContent = await persistImageContent(content);
               }
+              if (clearDataBusy || resetPending || epoch !== resetEpoch) return;
 
               const defaultCat =
                 type === 'text' && activeCategory !== DEFAULT_CATEGORY ? activeCategory : DEFAULT_CATEGORY;
               const newItem = {
                 type,
                 content: storedContent,
+                html: safe.html,
                 id: Date.now(),
                 timestamp: new Date().toISOString(),
                 category: defaultCat
@@ -735,6 +880,7 @@
 
               lastData = signature;
               updateAndSaveHistory([newItem, ...history]);
+              if (data.warning || safe.warning) triggerToast(data.warning || safe.warning);
             }
           }
         } catch (error) {
@@ -743,17 +889,19 @@
       }, 2000);
 
       vaultLockInterval = setInterval(() => {
-        if (vaultUnlocked && Date.now() - vaultLastActivity >= VAULT_AUTO_LOCK_MS) {
+        if (vaultRequirePassword && vaultUnlocked && Date.now() - vaultLastActivity >= VAULT_AUTO_LOCK_MS) {
           void lockVault();
         }
       }, 30_000);
 
       /** @param {ClipboardEvent} e */
       handlePaste = (e) => {
-        if (!captureEnabled) return;
+        if (!captureEnabled || clearDataBusy || resetPending || copyInFlight) return;
+        const epoch = resetEpoch;
         const active = document.activeElement;
         if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
         if (!e.clipboardData) return;
+        const safe = sanitizeClipboardHtml(e.clipboardData.getData('text/html'));
 
         const items = e.clipboardData.items;
         for (let i = 0; i < items.length; i++) {
@@ -762,6 +910,7 @@
             if (!blob) continue;
             const reader = new FileReader();
             reader.onload = async (event) => {
+              if (epoch !== resetEpoch || clearDataBusy || resetPending) return;
               const result = event?.target?.result;
               if (typeof result !== 'string') return;
               const base64 = result.split(',')[1];
@@ -783,6 +932,7 @@
                   timestamp: new Date().toISOString(),
                   category: DEFAULT_CATEGORY
                 };
+                if (epoch !== resetEpoch || clearDataBusy || resetPending) return;
                 lastData = signature;
                 updateAndSaveHistory([newItem, ...history]);
                 triggerToast('Image Pasted!');
@@ -792,19 +942,21 @@
           } else if (items[i].type === 'text/plain') {
             /** @param {string} text */
             items[i].getAsString((text) => {
-              const signature = clipboardSignature('text', text);
+              if (epoch !== resetEpoch || clearDataBusy || resetPending) return;
+              const signature = clipboardSignature('text', text, safe.html);
               if (signature !== lastData) {
                 const defaultCat = activeCategory !== DEFAULT_CATEGORY ? activeCategory : DEFAULT_CATEGORY;
                 const newItem = {
                   type: 'text',
                   content: text,
+                  html: safe.html,
                   id: Date.now(),
                   timestamp: new Date().toISOString(),
                   category: defaultCat
                 };
                 lastData = signature;
                 updateAndSaveHistory([newItem, ...history]);
-                triggerToast('Text Pasted!');
+                triggerToast(safe.warning || 'Text Pasted!');
               }
             });
           }
@@ -835,18 +987,38 @@
 
   /** @param {string} text */
   async function copyText(text) {
-    if (!text) return;
+    if (!text || clearDataBusy || resetPending) return;
+    copyInFlight++;
     try {
     await invoke('set_clipboard_text', { text });
     lastData = clipboardSignature('text', text);
     updateAndSaveHistory(history);
     triggerToast('Copied');
     } catch (error) { triggerToast(`Copy failed: ${String(error)}`); }
+    finally { copyInFlight--; }
+  }
+
+  /** @param {string} text @param {string=} html */
+  async function copyRichText(text, html) {
+    if (clearDataBusy || resetPending) return;
+    copyInFlight++;
+    try {
+      const safe = toClipboardHtml(text, html);
+      await invoke('set_clipboard_rich_text', { text, html: safe });
+      const actual = await invoke('get_clipboard_snapshot');
+      if (actual?.type === 'text' && actual.content === text) {
+        lastData = clipboardSignature('text', text, sanitizeClipboardHtml(actual.html).html);
+        localStorage.setItem(LAST_DATA_KEY, lastData);
+      }
+      triggerToast('Copied as HTML');
+    } catch (error) { triggerToast(`Copy failed: ${String(error)}`); }
+    finally { copyInFlight--; }
   }
 
   /** @param {string} content */
   async function copyImage(content) {
-    if (!content) return;
+    if (!content || clearDataBusy || resetPending) return;
+    copyInFlight++;
     try {
       isAppCopying = true;
       if (isFileImageContent(content)) {
@@ -861,11 +1033,13 @@
       }, 3000);
     } catch {
       triggerToast('Failed to copy');
-    }
+      isAppCopying = false;
+    } finally { copyInFlight--; }
   }
 
   /** @param {number} id */
   async function deleteItem(id) {
+    if (clearDataBusy || resetPending) return;
     const item = history.find((it) => it.id === id);
     const newHistory = history.filter((it) => it.id !== id);
     if (previewImage?.id === id) closeImagePreview();
@@ -874,7 +1048,7 @@
       closeImageMenu();
     }
     if (selectedClipId === id) selectedClipId = null;
-    if (item?.type === 'text' && item.content === lastData) {
+    if (item?.type === 'text' && clipboardSignature('text', item.content, item.html) === lastData) {
       await invoke('set_clipboard_text', { text: '' });
       lastData = '';
     }
@@ -882,6 +1056,7 @@
   }
 
   async function clearImages() {
+    if (clearDataBusy || resetPending) throw new Error('App reset is in progress');
     const removedImages = history.filter((item) => item.type !== 'text');
     const newHistory = history.filter((item) => item.type === 'text');
     if (previewImage) closeImagePreview();
@@ -891,7 +1066,12 @@
       await invoke('set_clipboard_text', { text: '' });
       lastData = '';
     }
-    updateAndSaveHistory(newHistory);
+    const previous = history;
+    history = newHistory;
+    if (!await persistClipboardStore()) { history = previous; throw new Error(storeError || 'Could not save image deletion'); }
+    const paths = collectImagePaths(removedImages);
+    if (paths.length) await invoke('delete_history_images', { paths });
+    triggerToast('All images cleared');
   }
 
   async function clearText() {
@@ -1091,10 +1271,8 @@
 
   /** @param {number} id */
   async function deletePassword(id) {
-    if (!vaultUnlocked) return;
-    const previous = passwords;
-    passwords = passwords.filter((pwd) => pwd.id !== id);
-    if (!await savePasswords()) passwords = previous;
+    if (!vaultUnlocked || vaultSaving || vaultBusy) return false;
+    return saveVaultSnapshot(passwords.filter((pwd) => pwd.id !== id), vaultCollections);
   }
 
   function clearAllPasswords() {
@@ -1103,12 +1281,14 @@
   }
 
   function exportPasswords() {
+    if (clearDataBusy || resetPending || vaultSaving) return;
     if (!vaultUnlocked) { activeTab = 'passwords'; triggerToast('Unlock the vault before exporting'); return; }
     const data = {
       format: PASSWORD_EXPORT_FORMAT,
       version: PASSWORD_EXPORT_VERSION,
       exportedAt: new Date().toISOString(),
-      passwords: passwords.map(({ title, username, password }) => ({ title, username, password }))
+      collections: vaultCollections,
+      passwords: passwords.map(({ title, username, password, collectionId }) => ({ title, username, password, collectionId: collectionId || null }))
     };
     const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a');
@@ -1120,6 +1300,7 @@
   }
 
   function requestPasswordImport() {
+    if (clearDataBusy || resetPending || vaultSaving) return;
     if (!vaultUnlocked) { activeTab = 'passwords'; triggerToast('Unlock the vault before importing'); return; }
     passwordImportInput?.click();
   }
@@ -1131,7 +1312,8 @@
 
   /** @param {Event & { currentTarget: HTMLInputElement }} event */
   async function importPasswords(event) {
-    if (!vaultUnlocked) return;
+    if (!vaultUnlocked || vaultSaving || vaultBusy || clearDataBusy || resetPending) return;
+    const epoch = resetEpoch;
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = '';
     if (!file) return;
@@ -1141,10 +1323,11 @@
     }
     try {
       const parsed = JSON.parse(await file.text());
+      if (epoch !== resetEpoch || !vaultUnlocked || clearDataBusy || resetPending) return;
       const entries = Array.isArray(parsed) ? parsed : parsed?.passwords;
       if (
         (!Array.isArray(parsed) &&
-          (parsed?.format !== PASSWORD_EXPORT_FORMAT || parsed?.version !== PASSWORD_EXPORT_VERSION)) ||
+          (parsed?.format !== PASSWORD_EXPORT_FORMAT || ![1, PASSWORD_EXPORT_VERSION].includes(parsed?.version))) ||
         !Array.isArray(entries)
       ) {
         throw new Error('unsupported file');
@@ -1152,6 +1335,21 @@
 
       const seen = new Set(passwords.map((item) => `${item.title}\u0000${item.username}\u0000${item.password}`));
       const usedIds = new Set(passwords.map((item) => item.id));
+      const nextCollections = vaultCollections.map(item => ({ ...item }));
+      /** @type {Map<string, string>} */
+      const collectionMap = new Map();
+      if (parsed?.version === 2) {
+        if (!Array.isArray(parsed.collections) || parsed.collections.length > 100) throw new Error('Invalid collections');
+        for (const collection of parsed.collections) {
+          if (typeof collection?.id !== 'string' || typeof collection?.name !== 'string' || collectionMap.has(collection.id)) throw new Error('Invalid collection');
+          const name = collection.name.trim();
+          if (!name || new TextEncoder().encode(name).length > 120) throw new Error('Invalid collection name');
+          let target = nextCollections.find(item => item.name.toLowerCase() === name.toLowerCase());
+          if (!target) { target = { id: crypto.randomUUID(), name }; nextCollections.push(target); }
+          collectionMap.set(collection.id, target.id);
+        }
+        if (nextCollections.length > 100) throw new Error('Too many collections');
+      }
       let nextId = Date.now();
       let skipped = 0;
       /** @type {PasswordItem[]} */
@@ -1173,19 +1371,20 @@
         }
 
         while (usedIds.has(nextId)) nextId++;
-        imported.push({ id: nextId++, title, username, password, showPass: false });
+        const collectionId = parsed?.version === 2 && entry.collectionId ? collectionMap.get(entry.collectionId) : null;
+        if (parsed?.version === 2 && entry.collectionId && !collectionId) throw new Error('Missing collection');
+        imported.push({ id: nextId++, title, username, password, collectionId, showPass: false });
         seen.add(signature);
       }
 
       skipped += Math.max(0, entries.length - MAX_IMPORTED_PASSWORDS);
-      if (imported.length === 0) {
+      if (imported.length === 0 && nextCollections.length === vaultCollections.length) {
         triggerToast(skipped ? 'No new passwords imported' : 'No passwords found');
         return;
       }
 
-      const previous = passwords;
-      passwords = [...imported, ...passwords];
-      if (!await savePasswords()) { passwords = previous; return; }
+      if (imported.length + passwords.length > MAX_IMPORTED_PASSWORDS) throw new Error('Too many passwords');
+      if (!await saveVaultSnapshot([...imported, ...passwords], nextCollections)) return;
       cancelEditPassword();
       triggerToast(`Imported ${imported.length}${skipped ? `, skipped ${skipped}` : ''}`);
     } catch {
@@ -1232,9 +1431,11 @@
   }
 
   $: filteredImages = history
-    .filter((item) => item.type !== 'text')
+    .filter((item) => item.type === 'image')
+    .filter((item) => activeCategory === DEFAULT_CATEGORY || (item.category || DEFAULT_CATEGORY) === activeCategory)
     .filter((item) => !searchQuery || `${item.timestamp} ${item.content.startsWith('file|') ? item.content.slice(5) : 'PNG image'}`.toLowerCase().includes(searchQuery.toLowerCase()));
   $: displayedText = history
+    .filter((item) => item.type !== 'image')
     .filter((item) => activeCategory === DEFAULT_CATEGORY || (item.category || DEFAULT_CATEGORY) === activeCategory)
     .filter((item) => recentFilter !== 'pinned' || item.isPinned)
     .filter((item) => !searchQuery || item.content.toLowerCase().includes(searchQuery.toLowerCase()));
@@ -1247,19 +1448,41 @@
 
   /** @param {number | null} id @param {string} title @param {string} username @param {string} password */
   async function saveReferencePassword(id, title, username, password) {
-    if (!vaultUnlocked) return;
-    if (id === null) {
-      newPwdTitle = title;
-      newPwdUser = username;
-      newPwdPass = password;
-      return await addPassword();
-    } else {
-      editingPasswordId = id;
-      editPwdTitle = title;
-      editPwdUser = username;
-      editPwdPass = password;
-      return await saveEditedPassword();
+    if (!vaultUnlocked || vaultSaving || vaultBusy || !title.trim() || !password) return false;
+    const existing = id === null ? null : passwords.find(item => item.id === id);
+    if (id !== null && !existing) { vaultError = 'Password no longer exists'; return false; }
+    let nextId = id ?? Date.now();
+    if (id === null) while (passwords.some(item => item.id === nextId)) nextId++;
+    const item = { id: nextId, title: title.trim(), username: username.trim(), password, showPass: false, collectionId: existing?.collectionId || (id === null ? activePasswordCollection || null : null) };
+    const next = id === null ? [item, ...passwords] : passwords.map(row => row.id === id ? item : row);
+    return await saveVaultSnapshot(next, vaultCollections) ? nextId : false;
+  }
+
+  /** @param {string | null} id @param {string} name */
+  async function saveVaultCollection(id, name) {
+    if (!vaultUnlocked || vaultSaving || vaultBusy) return false;
+    name = name.trim();
+    if (!name || new TextEncoder().encode(name).length > 120 || vaultCollections.some(item => item.id !== id && item.name.toLowerCase() === name.toLowerCase())) {
+      vaultError = 'Use a non-empty, unique collection name (up to 120 UTF-8 bytes).';
+      return false;
     }
+    const collection = { id: id || crypto.randomUUID(), name };
+    const next = id ? vaultCollections.map(item => item.id === id ? collection : item) : [...vaultCollections, collection];
+    return saveVaultSnapshot(passwords, next);
+  }
+
+  /** @param {string} id */
+  async function removeVaultCollection(id) {
+    if (!vaultUnlocked || vaultSaving || vaultBusy) return false;
+    const saved = await saveVaultSnapshot(passwords.map(item => item.collectionId === id ? { ...item, collectionId: null } : item), vaultCollections.filter(item => item.id !== id));
+    if (saved && activePasswordCollection === id) activePasswordCollection = '';
+    return saved;
+  }
+
+  /** @param {number} id @param {string | null} collectionId */
+  async function movePassword(id, collectionId) {
+    if (!vaultUnlocked || vaultSaving || vaultBusy) return false;
+    return saveVaultSnapshot(passwords.map(item => item.id === id ? { ...item, collectionId } : item), vaultCollections);
   }
 
   /** @param {string} name */
@@ -1304,6 +1527,10 @@
   bind:clearDataConfirmation
   bind:shortcutValue
   bind:retentionHours
+  bind:activePasswordCollection
+  {vaultCollections}
+  {vaultSaving}
+  {resetPending}
   {storeReady}
   {storeError}
   {captureError}
@@ -1315,6 +1542,10 @@
   {categories}
   {vaultExists}
   {vaultUnlocked}
+  {vaultRequirePassword}
+  {vaultAutoUnlockAvailable}
+  {vaultStatusReady}
+  bind:vaultAccessError
   {vaultBusy}
   {vaultError}
   {clearDataBusy}
@@ -1329,6 +1560,7 @@
   {filteredImages}
   {filteredPasswords}
   copyTextFn={copyText}
+  copyRichTextFn={copyRichText}
   copyImageFn={copyImage}
   deleteItemFn={deleteItem}
   clearImagesFn={clearImages}
@@ -1343,7 +1575,11 @@
   getImgSrcFn={getImgSrc}
   setupVaultFn={setupVault}
   unlockVaultFn={unlockVault}
+  setVaultRequirePasswordFn={setVaultRequirePassword}
   savePasswordFn={saveReferencePassword}
+  saveVaultCollectionFn={saveVaultCollection}
+  removeVaultCollectionFn={removeVaultCollection}
+  movePasswordFn={movePassword}
   deletePasswordFn={deletePassword}
   addCollectionFn={addReferenceCollection}
   renameCollectionFn={renameCollection}

@@ -14,3 +14,18 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 # 忽略 Rust 编译输出目录
 src-tauri/target/
+
+# 私人恢复材料仅留本机，不进入公开仓库。
+/appdata_*/
+/post_restore*/
+/recovered_appdata/
+/recovery_from_git/
+/tmp_leveldb_copy/
+/static/recovery-import.json
+/HANDOFF.md
+
+# 临时验收与未采用的设计产物。
+/artifacts/
+/static/design/
+/static/handoff/
+/tmp_screenshot*.png

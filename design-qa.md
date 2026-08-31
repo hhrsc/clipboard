@@ -1,5 +1,7 @@
 # Phase 2 — Pixel QA + Native Integration
 
+> 后续按钮功能阶段（2026-08-31）：新增实现的桌面功能和视觉验收由用户执行，状态为待验收。见 [按钮功能交付说明](docs/button-functions-handoff.md)。下文的 PASS、截图、测试数字及 exe 哈希仅对应 Phase 2，不代表当前新增功能已经验收。
+
 日期：2026-08-31。范围：Windows Tauri 桌面、1586 × 992 目标 viewport、四页参考状态和现有核心业务。Phase 1 报告已保留在 `design-qa/phase1-report.md`。
 
 ## Visual QA
