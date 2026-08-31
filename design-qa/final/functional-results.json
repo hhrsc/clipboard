@@ -1,0 +1,166 @@
+{
+  "core": [
+    {
+      "name": "native bridge and production data mode",
+      "pass": true
+    },
+    {
+      "name": "native CSS viewport 1586x992",
+      "pass": true
+    },
+    {
+      "name": "empty history state",
+      "pass": true
+    },
+    {
+      "name": "capture saved on",
+      "pass": true
+    },
+    {
+      "name": "live clipboard text captured and selected",
+      "pass": true
+    },
+    {
+      "name": "UI copy text reaches Windows clipboard",
+      "pass": true
+    },
+    {
+      "name": "pin persisted",
+      "pass": true
+    },
+    {
+      "name": "search empty result",
+      "pass": true
+    },
+    {
+      "name": "delete text persisted",
+      "pass": true
+    },
+    {
+      "name": "native image capture and thumbnail decode",
+      "pass": true
+    },
+    {
+      "name": "UI copy image reaches Windows clipboard",
+      "pass": true
+    },
+    {
+      "name": "capture pause stops new records",
+      "pass": true
+    },
+    {
+      "name": "retention configuration saved",
+      "pass": true
+    },
+    {
+      "name": "autostart toggled natively",
+      "pass": true
+    },
+    {
+      "name": "autostart restored",
+      "pass": true
+    },
+    {
+      "name": "global shortcut saved natively",
+      "pass": true
+    }
+  ],
+  "vault": [
+    {
+      "name": "existing encrypted vault setup/unlock UI",
+      "pass": true
+    },
+    {
+      "name": "password creation persisted",
+      "pass": true
+    },
+    {
+      "name": "password edit persisted",
+      "pass": true
+    },
+    {
+      "name": "copy username",
+      "pass": true
+    },
+    {
+      "name": "copy password",
+      "pass": true
+    },
+    {
+      "name": "password search",
+      "pass": true
+    },
+    {
+      "name": "vault lock clears native key",
+      "pass": true
+    },
+    {
+      "name": "vault unlock reloads persisted data",
+      "pass": true
+    }
+  ],
+  "edge": [
+    {
+      "name": "JSON import through existing file input handler",
+      "pass": true
+    },
+    {
+      "name": "password deletion persisted",
+      "pass": true
+    },
+    {
+      "name": "missing file has explicit fallback",
+      "pass": true
+    },
+    {
+      "name": "missing file copy disabled",
+      "pass": true
+    },
+    {
+      "name": "image deletion persisted",
+      "pass": true
+    },
+    {
+      "name": "original Windows clipboard restored",
+      "pass": true
+    }
+  ],
+  "production": [
+    {
+      "name": "production native startup and viewport",
+      "pass": true
+    },
+    {
+      "name": "real history loaded without storage error",
+      "pass": true
+    },
+    {
+      "name": "production page Images",
+      "pass": true
+    },
+    {
+      "name": "production page Passwords",
+      "pass": true
+    },
+    {
+      "name": "production page Settings",
+      "pass": true
+    },
+    {
+      "name": "production page Recent",
+      "pass": true
+    },
+    {
+      "name": "collection creation persisted",
+      "pass": true
+    },
+    {
+      "name": "collection rename persisted",
+      "pass": true
+    },
+    {
+      "name": "test collection removed; user records preserved",
+      "pass": true
+    }
+  ]
+}

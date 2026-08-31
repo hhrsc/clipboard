@@ -1,0 +1,38 @@
+[
+  {
+    "page": "recent",
+    "size": [
+      1586,
+      992
+    ],
+    "mean_absolute_rgb_error": 5.5279,
+    "pixels_over_24_rgb_delta_percent": 5.4087
+  },
+  {
+    "page": "images",
+    "size": [
+      1586,
+      992
+    ],
+    "mean_absolute_rgb_error": 2.8203,
+    "pixels_over_24_rgb_delta_percent": 2.5856
+  },
+  {
+    "page": "passwords",
+    "size": [
+      1586,
+      992
+    ],
+    "mean_absolute_rgb_error": 4.8043,
+    "pixels_over_24_rgb_delta_percent": 3.7417
+  },
+  {
+    "page": "settings",
+    "size": [
+      1586,
+      992
+    ],
+    "mean_absolute_rgb_error": 3.838,
+    "pixels_over_24_rgb_delta_percent": 3.5156
+  }
+]

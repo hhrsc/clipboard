@@ -1,6 +1,10 @@
 .DS_Store
 node_modules
 /build
+
+# 本地自动化快照可能包含真实历史，不进入版本控制。
+/.playwright-cli/
+/output/
 /.svelte-kit
 /package
 .env

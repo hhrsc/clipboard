@@ -1,0 +1,15 @@
+{
+  "date": "2026-08-31",
+  "referenceViewport": {"width": 1586, "height": 992},
+  "implementationViewport": {"width": 1586, "height": 992},
+  "deviceScaleFactor": 1,
+  "browserZoom": "100%",
+  "visualViewportScale": 1,
+  "format": "PNG",
+  "capture": "Playwright CLI / Chromium page.screenshot(type=png, fullPage=false, scale=css)",
+  "postCaptureResize": false,
+  "jpegConversion": false,
+  "lossyCompression": false,
+  "nativeEnvironment": {"engine": "WebView2 151.0.4129.107", "viewport": [1586, 992], "deviceScaleFactor": 1.5},
+  "note": "Reference comparisons use fixed-DPR browser captures only. Native captures verify functionality and are not mixed into reference diff metrics."
+}

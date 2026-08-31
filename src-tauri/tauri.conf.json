@@ -13,9 +13,9 @@
     "windows": [
   {
     "title": "Clipboard Manager",
-    "width": 680,
-    "height": 620,
-    "decorations": true,
+    "width": 1586,
+    "height": 992,
+    "decorations": false,
     "transparent": false,
     "resizable": true,
     "fullscreen": false

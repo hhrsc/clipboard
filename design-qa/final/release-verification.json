@@ -1,0 +1,22 @@
+{
+  "date": "2026-08-31",
+  "verdict": "PASS WITH ASSET LIMITATIONS",
+  "executable": "E:/clipboard/my-clipboard/src-tauri/target/release/my-clipboard.exe",
+  "sha256": "6D0CA995EDE5851F41E8D16794974C6D44B3947DD33B9936EC55D415B5ABDB19",
+  "pid": 35804,
+  "nativeWindowId": 17043178,
+  "normalLaunch": true,
+  "remoteDebuggingEnabledForFinalLaunch": false,
+  "qaProcessStopped": true,
+  "realRecentUiObserved": true,
+  "oldTemplateTitlePresent": false,
+  "recordCount": 30,
+  "storageErrorVisible": false,
+  "stderrBytes": 0,
+  "privateRecoveryPayloadBundled": false,
+  "svelteCheck": {"errors": 0, "warnings": 0},
+  "rustUnitTests": {"passed": 6, "failed": 0},
+  "nativeProgrammaticChecks": {"passed": 39, "failed": 0},
+  "qaRestartObservationChecks": {"passed": 6, "failed": 0},
+  "knownMissingLegacyImages": 4
+}

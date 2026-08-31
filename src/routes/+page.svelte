@@ -1,13 +1,19 @@
 <script>
-  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
-  import { afterUpdate, onMount } from 'svelte';
-  import { fade, fly, scale } from 'svelte/transition';
+  import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
+  import { onMount } from 'svelte';
+  import ClipboardApp from '$lib/ClipboardApp.svelte';
 
   const DEFAULT_CATEGORY = '全部';
   const HISTORY_KEY = 'clip_v5_split';
   const LAST_DATA_KEY = 'clip_v5_last_data';
   const PASSWORDS_KEY = 'clip_v5_passwords';
   const CATEGORIES_KEY = 'clip_v5_categories';
+  const PREFERENCES_KEY = 'clip_v6_preferences';
+  const RECOVERY_FLAG_KEY = 'clip_v5_recovery_imported';
+  const PASSWORD_EXPORT_FORMAT = 'my-clipboard-passwords';
+  const PASSWORD_EXPORT_VERSION = 1;
+  const MAX_PASSWORD_IMPORT_BYTES = 1024 * 1024;
+  const MAX_IMPORTED_PASSWORDS = 1000;
 
   /**
    * @typedef {Object} HistoryItem
@@ -16,6 +22,8 @@
    * @property {number} id
    * @property {string} timestamp
    * @property {string=} category
+   * @property {boolean=} restored
+   * @property {boolean=} isPinned
    */
 
   /**
@@ -27,7 +35,7 @@
    * @property {boolean} showPass
    */
 
-  let activeTab = 'clipboard';
+  let activeTab = 'recent';
   let showToast = false;
   let toastMsg = 'Copied!';
 
@@ -35,19 +43,55 @@
   /** @type {HistoryItem[]} */
   let history = [];
   let lastData = '';
+  let captureEnabled = true;
+  let retentionHours = 24;
+  let officialWebsite = 'https://www.gov.cn/';
+  let storeReady = false;
+  let storeError = '';
+  let captureError = '';
+  let settingsBusy = false;
+  let autostartEnabled = false;
+  let autostartError = '';
+  let storeWrites = Promise.resolve(true);
+  let shortcutValue = 'Alt+C';
+  let shortcutBusy = false;
+  let shortcutError = '';
+  let showClearDataConfirm = false;
+  let clearDataConfirmation = '';
+  let clearDataBusy = false;
+  let clearDataError = '';
 
   let pwdSearchQuery = '';
   /** @type {PasswordItem[]} */
   let passwords = [];
+  let vaultExists = false;
+  let vaultUnlocked = false;
+  let vaultBusy = false;
+  let vaultError = '';
+  let masterPassword = '';
+  let masterPasswordConfirm = '';
+  let unlockPassword = '';
+  const VAULT_AUTO_LOCK_MS = 5 * 60 * 1000;
+  let vaultLastActivity = Date.now();
   let newPwdTitle = '';
   let newPwdUser = '';
   let newPwdPass = '';
+  /** @type {number | null} */
+  let editingPasswordId = null;
+  let editPwdTitle = '';
+  let editPwdUser = '';
+  let editPwdPass = '';
+  /** @type {HTMLInputElement | undefined} */
+  let passwordImportInput;
 
   let showNewPwd = false;
   let isAppCopying = false;
 
   let categories = [DEFAULT_CATEGORY];
   let activeCategory = DEFAULT_CATEGORY;
+  let recentFilter = 'all';
+  /** @type {number | null} */
+  let selectedClipId = null;
   let isAddingCat = false;
   let newCatName = '';
 
@@ -68,23 +112,6 @@
   let isRenamingCat = false;
   let renameCatName = '';
 
-  /** @type {HTMLButtonElement | undefined} */
-  let clipboardTabEl;
-  /** @type {HTMLButtonElement | undefined} */
-  let passwordTabEl;
-  let tabLineX = 0;
-  let tabLineW = 0;
-
-  function syncTabIndicator() {
-    const activeTabEl = activeTab === 'clipboard' ? clipboardTabEl : passwordTabEl;
-    if (!activeTabEl) return;
-
-    const nextX = activeTabEl.offsetLeft;
-    const nextW = activeTabEl.offsetWidth;
-    if (nextX !== tabLineX) tabLineX = nextX;
-    if (nextW !== tabLineW) tabLineW = nextW;
-  }
-
   /** @param {WheelEvent & { currentTarget: HTMLElement }} event */
   function handleCategoryWheel(event) {
     const delta = Math.abs(event.deltaY) > Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
@@ -95,8 +122,6 @@
   function clampPreviewScale(nextScale) {
     return Math.min(4, Math.max(0.2, Number(nextScale.toFixed(2))));
   }
-
-  afterUpdate(syncTabIndicator);
 
   /** @param {string} content */
   function imageClipboardSignature(content) {
@@ -174,11 +199,16 @@
   /** @param {HistoryItem[]} newArray */
   function updateAndSaveHistory(newArray) {
     const previousHistory = history;
-    const EXPIRATION_MS = 24 * 60 * 60 * 1000;
+    const EXPIRATION_MS = retentionHours * 60 * 60 * 1000;
     const now = Date.now();
 
     const valid = newArray.filter((item) => {
-      if (item.type === 'text' && (!item.category || item.category === DEFAULT_CATEGORY)) {
+      if (
+        item.type === 'text' &&
+        !item.restored &&
+        !item.isPinned &&
+        (!item.category || item.category === DEFAULT_CATEGORY)
+      ) {
         return now - item.id < EXPIRATION_MS;
       }
       return true;
@@ -188,11 +218,12 @@
     const categorizedTexts = valid.filter(
       (item) => item.type === 'text' && item.category && item.category !== DEFAULT_CATEGORY
     );
+    const pinnedTexts = valid.filter((item) => item.type === 'text' && item.isPinned && (!item.category || item.category === DEFAULT_CATEGORY));
     const uncategorizedTexts = valid.filter(
-      (item) => item.type === 'text' && (!item.category || item.category === DEFAULT_CATEGORY)
+      (item) => item.type === 'text' && !item.isPinned && (!item.category || item.category === DEFAULT_CATEGORY)
     );
 
-    const merged = [...imgs.slice(0, 10), ...categorizedTexts, ...uncategorizedTexts.slice(0, 50)];
+    const merged = [...imgs.slice(0, 10), ...categorizedTexts, ...pinnedTexts, ...uncategorizedTexts.slice(0, 50)];
     merged.sort((a, b) => b.id - a.id);
 
     const mergedIds = new Set(merged.map((item) => item.id));
@@ -201,178 +232,595 @@
     );
 
     history = merged;
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
     localStorage.setItem(LAST_DATA_KEY, lastData);
-    if (removedImages.length > 0) {
-      void cleanupImageFilesFromItems(removedImages);
-    }
+    void persistClipboardStore().then((saved) => {
+      if (saved && removedImages.length) void cleanupImageFilesFromItems(removedImages);
+    });
+  }
+
+  function persistClipboardStore() {
+    if (!storeReady) return Promise.resolve(false);
+      /** @type {Map<string, string>} */
+      const catMap = new Map();
+      catMap.set(DEFAULT_CATEGORY, "all");
+      const nativeCats = [{ id: "all", name: DEFAULT_CATEGORY }];
+      let idx = 1;
+      for (const catName of categories) {
+        if (catName === DEFAULT_CATEGORY || !catName.trim()) continue;
+        const id = `category-${idx++}`;
+        catMap.set(catName, id);
+        nativeCats.push({ id, name: catName });
+      }
+
+      const records = history.map((item) => ({
+        type: item.type,
+        content: item.content,
+        id: item.id,
+        timestamp: item.timestamp,
+        categoryId: catMap.get(item.category || DEFAULT_CATEGORY) || "all",
+        restored: !!item.restored,
+        isPinned: !!item.isPinned
+      }));
+
+      const store = {
+        version: 1,
+        categories: nativeCats,
+        records,
+        preferences: {
+          captureEnabled,
+          retentionHours,
+          officialWebsite
+        }
+      };
+
+      // 串行写入完整快照，避免较旧的请求覆盖新记录。
+      storeWrites = storeWrites.then(async () => {
+        try {
+          await invoke('clipboard_store_replace', { store });
+          storeError = '';
+          return true;
+        } catch (error) {
+          storeError = `Changes are not saved: ${String(error)}`;
+          return false;
+        }
+      });
+      return storeWrites;
   }
 
   function savePasswords() {
-    localStorage.setItem(PASSWORDS_KEY, JSON.stringify(passwords));
+    if (!vaultUnlocked) return Promise.resolve(false);
+    return persistVaultPasswords();
+  }
+
+  async function persistVaultPasswords() {
+    try {
+      await invoke('vault_replace_passwords', {
+        passwords: passwords.map(({ id, title, username, password }) => ({ id, title, username, password }))
+      });
+      vaultError = '';
+      return true;
+    } catch (error) {
+      vaultError = `Could not save password vault: ${String(error)}`;
+      return false;
+    }
+  }
+
+  /** @param {Array<{id: number, title: string, username: string, password: string}>} records */
+  function loadVaultPasswords(records) {
+    passwords = records.map((item) => ({ ...item, showPass: false }));
+  }
+
+  async function loadVaultStatus() {
+    try {
+      const status = await invoke('vault_status');
+      vaultExists = status.exists;
+      if (status.unlocked) await invoke('vault_lock');
+      vaultUnlocked = false;
+    } catch {
+      vaultError = 'Secure password vault is unavailable.';
+    }
+  }
+
+  async function setupVault() {
+    vaultError = '';
+    if (masterPassword !== masterPasswordConfirm) {
+      vaultError = 'The master passwords do not match.';
+      return;
+    }
+
+    vaultBusy = true;
+    try {
+      const records = await invoke('vault_setup', {
+        masterPassword,
+        legacyPasswords: passwords.map(({ id, title, username, password }) => ({ id, title, username, password }))
+      });
+      loadVaultPasswords(records);
+      localStorage.removeItem(PASSWORDS_KEY);
+      vaultExists = true;
+      vaultUnlocked = true;
+      vaultLastActivity = Date.now();
+      masterPassword = '';
+      masterPasswordConfirm = '';
+      triggerToast('Secure vault created');
+    } catch (error) {
+      vaultError = error instanceof Error ? error.message : 'Could not create secure vault.';
+    } finally {
+      vaultBusy = false;
+    }
+  }
+
+  async function unlockVault() {
+    vaultError = '';
+    vaultBusy = true;
+    try {
+      const records = await invoke('vault_unlock', { masterPassword: unlockPassword });
+      loadVaultPasswords(records);
+      unlockPassword = '';
+      vaultUnlocked = true;
+      vaultLastActivity = Date.now();
+      triggerToast('Password vault unlocked');
+    } catch (error) {
+      vaultError = error instanceof Error ? error.message : 'Could not unlock password vault.';
+    } finally {
+      vaultBusy = false;
+    }
+  }
+
+  async function lockVault() {
+    try {
+      await invoke('vault_lock');
+      passwords = [];
+      pwdSearchQuery = '';
+      vaultUnlocked = false;
+      triggerToast('Password vault locked');
+    } catch {
+      triggerToast('Could not lock password vault');
+    }
+  }
+
+  function noteVaultActivity() {
+    if (vaultUnlocked) vaultLastActivity = Date.now();
   }
 
   function saveCategories() {
-    localStorage.setItem(CATEGORIES_KEY, JSON.stringify(categories));
+    void persistClipboardStore();
+  }
+
+  function savePreferences() {
+    void persistClipboardStore();
+  }
+
+  async function toggleCapture() {
+    if (!storeReady || settingsBusy) return;
+    settingsBusy = true;
+    captureEnabled = !captureEnabled;
+    if (await persistClipboardStore()) triggerToast(captureEnabled ? 'Clipboard capture resumed' : 'Clipboard capture paused');
+    else captureEnabled = !captureEnabled;
+    settingsBusy = false;
+  }
+
+  async function saveRetention() {
+    if (!storeReady || settingsBusy) return;
+    if (!Number.isInteger(retentionHours) || retentionHours < 1 || retentionHours > 8760) {
+      storeError = 'Retention must be between 1 and 8760 hours.';
+      return;
+    }
+    settingsBusy = true;
+    if (await persistClipboardStore()) triggerToast('Retention saved');
+    settingsBusy = false;
+  }
+
+  async function toggleAutostart() {
+    autostartError = '';
+    settingsBusy = true;
+    try {
+      autostartEnabled = await invoke('set_autostart', { enabled: !autostartEnabled });
+    } catch (error) {
+      autostartError = String(error);
+    } finally { settingsBusy = false; }
+  }
+
+  async function updateShortcut() {
+    shortcutBusy = true;
+    shortcutError = '';
+    try {
+      const status = await invoke('update_global_shortcut', { shortcut: shortcutValue });
+      shortcutValue = status.shortcut;
+      triggerToast(`Shortcut set to ${shortcutValue}`);
+    } catch (error) {
+      shortcutError = error instanceof Error ? error.message : 'Could not update shortcut';
+      try {
+        const status = await invoke('shortcut_status');
+        shortcutValue = status.shortcut;
+      } catch {
+        // keep the current visible value when native status is unavailable
+      }
+    } finally {
+      shortcutBusy = false;
+    }
+  }
+
+  async function openOfficialWebsite() {
+    try {
+      await invoke('open_in_chrome', { url: officialWebsite });
+    } catch (error) {
+      triggerToast(error instanceof Error ? error.message : 'Could not open Google Chrome');
+    }
+  }
+
+  async function clearAllAppData() {
+    if (clearDataConfirmation !== 'DELETE') {
+      clearDataError = 'Type DELETE to confirm.';
+      return;
+    }
+    clearDataBusy = true;
+    clearDataError = '';
+    const previousCapture = captureEnabled;
+    captureEnabled = false;
+    try {
+      await storeWrites;
+      await invoke('clipboard_store_replace', { store: { version: 1, records: [], categories: [{ id: 'all', name: DEFAULT_CATEGORY }], preferences: { captureEnabled: true, retentionHours: 24, officialWebsite: 'https://www.gov.cn/' } } });
+      await invoke('vault_delete');
+      await cleanupImageFilesFromItems(history.filter((item) => item.type !== 'text'));
+      localStorage.removeItem(HISTORY_KEY);
+      localStorage.removeItem(LAST_DATA_KEY);
+      localStorage.removeItem(PASSWORDS_KEY);
+      localStorage.removeItem(CATEGORIES_KEY);
+      localStorage.removeItem(PREFERENCES_KEY);
+      localStorage.setItem(RECOVERY_FLAG_KEY, '1');
+      history = [];
+      categories = [DEFAULT_CATEGORY];
+      activeCategory = DEFAULT_CATEGORY;
+      selectedClipId = null;
+      lastData = '';
+      passwords = [];
+      vaultExists = false;
+      vaultUnlocked = false;
+      captureEnabled = true;
+      retentionHours = 24;
+      showClearDataConfirm = false;
+      clearDataConfirmation = '';
+      triggerToast('All local app data cleared');
+    } catch (error) {
+      captureEnabled = previousCapture;
+      clearDataError = error instanceof Error ? error.message : 'Could not clear local data';
+    } finally {
+      clearDataBusy = false;
+    }
+  }
+
+  async function maybeImportRecoveryData() {
+    if (localStorage.getItem(RECOVERY_FLAG_KEY)) {
+      return false;
+    }
+
+    try {
+      const response = await fetch('/recovery-import.json', { cache: 'no-store' });
+      if (!response.ok) return false;
+
+      const data = await response.json();
+      if (!Array.isArray(data?.history) || !Array.isArray(data?.passwords) || !Array.isArray(data?.categories)) {
+        return false;
+      }
+
+      const importedHistory = data.history.map(/** @param {HistoryItem} item */ (item) =>
+        item?.type === 'text' ? { ...item, restored: true } : item
+      );
+
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(importedHistory));
+      localStorage.setItem(LAST_DATA_KEY, typeof data.lastData === 'string' ? data.lastData : '');
+      localStorage.setItem(PASSWORDS_KEY, JSON.stringify(data.passwords));
+      localStorage.setItem(CATEGORIES_KEY, JSON.stringify(data.categories));
+      localStorage.setItem(RECOVERY_FLAG_KEY, '1');
+      return true;
+    } catch {
+      // ignore recovery import failures
+      return false;
+    }
   }
 
   onMount(() => {
-    const saved = localStorage.getItem(HISTORY_KEY);
-    if (saved) {
+    /** @type {ReturnType<typeof setInterval> | undefined} */
+    let clipboardInterval;
+    /** @type {((e: ClipboardEvent) => void) | undefined} */
+    let handlePaste;
+    /** @type {ReturnType<typeof setInterval> | undefined} */
+    let vaultLockInterval;
+    let disposed = false;
+
+    const init = async () => {
+      if (!isTauri()) return;
+      if (disposed) return;
+      await loadVaultStatus();
+      if (disposed) return;
+      // 原生写入成功前保留旧存储，避免迁移失败丢失数据。
       try {
-        history = JSON.parse(saved);
-      } catch {
-        history = [];
-      }
-    }
-
-    const savedLastData = localStorage.getItem(LAST_DATA_KEY);
-    if (savedLastData) lastData = savedLastData;
-
-    const savedPwds = localStorage.getItem(PASSWORDS_KEY);
-    if (savedPwds) {
-      try {
-        passwords = JSON.parse(savedPwds);
-      } catch {
-        passwords = [];
-      }
-    }
-
-    const savedCats = localStorage.getItem(CATEGORIES_KEY);
-    if (savedCats) {
-      try {
-        categories = JSON.parse(savedCats);
-      } catch {
-        categories = [DEFAULT_CATEGORY];
-      }
-    }
-
-    if (!categories.includes(DEFAULT_CATEGORY)) {
-      categories = [DEFAULT_CATEGORY, ...categories];
-      saveCategories();
-    }
-
-    updateAndSaveHistory(history);
-    void migrateLegacyImageItems();
-
-    const clipboardInterval = setInterval(async () => {
-      const now = Date.now();
-      const EXPIRATION_MS = 24 * 60 * 60 * 1000;
-      if (
-        history.some(
-          (item) =>
-            item.type === 'text' &&
-            (!item.category || item.category === DEFAULT_CATEGORY) &&
-            now - item.id > EXPIRATION_MS
-        )
-      ) {
-        updateAndSaveHistory(history);
-      }
-
-      try {
-        const data = await invoke('get_clipboard_data');
-        if (data) {
-          const [type, content] = data;
-          const signature = clipboardSignature(type, content);
-          if (signature !== lastData) {
-            if (isAppCopying && type === 'image') {
-              lastData = signature;
-              isAppCopying = false;
-              updateAndSaveHistory(history);
-              return;
-            }
-
-            let storedContent = content;
-            if (type === 'image') {
-              storedContent = await persistImageContent(content);
-            }
-
-            const defaultCat =
-              type === 'text' && activeCategory !== DEFAULT_CATEGORY ? activeCategory : DEFAULT_CATEGORY;
-            const newItem = {
-              type,
-              content: storedContent,
-              id: Date.now(),
-              timestamp: new Date().toLocaleString(),
-              category: defaultCat
-            };
-
-            lastData = signature;
-            updateAndSaveHistory([newItem, ...history]);
+        const storeStatus = await invoke("clipboard_store_status");
+        if (storeStatus && storeStatus.exists) {
+          const loadedStore = await invoke("clipboard_store_load");
+          const idToName = new Map();
+          for (const cat of loadedStore.categories) {
+            idToName.set(cat.id, cat.name);
           }
+          categories = loadedStore.categories.map(/** @param {{id: string, name: string}} c */ (c) => c.name);
+          if (!categories.includes(DEFAULT_CATEGORY)) {
+            categories = [DEFAULT_CATEGORY, ...categories];
+          }
+          history = loadedStore.records.map(/** @param {{type: string, content: string, id: number, timestamp: string, categoryId: string, restored?: boolean, isPinned?: boolean}} r */ (r) => ({
+            type: r.type,
+            content: r.content,
+            id: r.id,
+            timestamp: r.timestamp,
+            category: idToName.get(r.categoryId) || DEFAULT_CATEGORY,
+            restored: !!r.restored,
+            isPinned: !!r.isPinned
+          }));
+          if (loadedStore.preferences && typeof loadedStore.preferences.captureEnabled === "boolean") {
+            captureEnabled = loadedStore.preferences.captureEnabled;
+            retentionHours = loadedStore.preferences.retentionHours;
+            officialWebsite = loadedStore.preferences.officialWebsite;
+          }
+          const cached = localStorage.getItem(HISTORY_KEY);
+          if (cached) {
+            const legacy = JSON.parse(cached);
+            if (!Array.isArray(legacy)) throw new Error('Legacy history is invalid');
+            const known = new Set(history.map((item) => item.id));
+            const pending = legacy.filter((item) => !known.has(item.id));
+            for (const item of pending) {
+              if (item.type === 'image' && !isFileImageContent(item.content)) item.content = await persistImageContent(item.content);
+            }
+            history = [...history, ...pending].sort((a, b) => b.id - a.id);
+            categories = [...new Set([...categories, ...pending.map((item) => item.category || DEFAULT_CATEGORY)])];
+            storeReady = true;
+            if (!await persistClipboardStore()) { storeReady = false; return; }
+            localStorage.removeItem(HISTORY_KEY);
+            localStorage.removeItem(CATEGORIES_KEY);
+            localStorage.removeItem(PREFERENCES_KEY);
+          }
+        } else {
+          /** @type {Array<{type: string, content: string, id: number, timestamp: string, category: string, restored: boolean, isPinned: boolean}>} */
+          let legacyRecords = [];
+          let legacyCategories = [DEFAULT_CATEGORY];
+          let legacyPreferences = { captureEnabled: true, retentionHours: 24, officialWebsite: "https://www.gov.cn/" };
+
+          const savedHistory = localStorage.getItem(HISTORY_KEY);
+          if (savedHistory) {
+            try {
+              const parsed = JSON.parse(savedHistory);
+              if (Array.isArray(parsed)) {
+                legacyRecords = parsed.map((item) => ({
+                  type: item.type || "text",
+                  content: item.content || "",
+                  id: item.id || Date.now(),
+                  timestamp: item.timestamp || "",
+                  category: item.category || DEFAULT_CATEGORY,
+                  restored: !!item.restored,
+                  isPinned: !!item.isPinned
+                }));
+              } else throw new Error('Legacy history is invalid');
+            } catch { throw new Error('Legacy history could not be read'); }
+          }
+
+          const savedCats = localStorage.getItem(CATEGORIES_KEY);
+          if (savedCats) {
+            try {
+              const parsed = JSON.parse(savedCats);
+              if (!Array.isArray(parsed)) throw new Error('Legacy collections are invalid');
+              legacyCategories = parsed;
+            } catch { throw new Error('Legacy collections could not be read'); }
+          }
+
+          const savedPrefs = localStorage.getItem(PREFERENCES_KEY);
+          if (savedPrefs) {
+            try {
+              const parsed = JSON.parse(savedPrefs);
+              if (typeof parsed?.captureEnabled === "boolean") legacyPreferences.captureEnabled = parsed.captureEnabled;
+            } catch { throw new Error('Legacy preferences could not be read'); }
+          }
+
+          for (const item of legacyRecords) {
+            if (item.type === 'image' && !isFileImageContent(item.content)) item.content = await persistImageContent(item.content);
+          }
+          legacyCategories = [...new Set([...legacyCategories, ...legacyRecords.map((item) => item.category)])];
+          const migratedStore = await invoke("clipboard_store_migrate_legacy", {
+            legacyRecords,
+            legacyCategories,
+            preferences: legacyPreferences
+          });
+
+          const idToName = new Map();
+          for (const cat of migratedStore.categories) {
+            idToName.set(cat.id, cat.name);
+          }
+          categories = migratedStore.categories.map(/** @param {{id: string, name: string}} c */ (c) => c.name);
+          if (!categories.includes(DEFAULT_CATEGORY)) {
+            categories = [DEFAULT_CATEGORY, ...categories];
+          }
+          history = migratedStore.records.map(/** @param {{type: string, content: string, id: number, timestamp: string, categoryId: string, restored?: boolean, isPinned?: boolean}} r */ (r) => ({
+            type: r.type,
+            content: r.content,
+            id: r.id,
+            timestamp: r.timestamp,
+            category: idToName.get(r.categoryId) || DEFAULT_CATEGORY,
+            restored: !!r.restored,
+            isPinned: !!r.isPinned
+          }));
+          if (migratedStore.preferences && typeof migratedStore.preferences.captureEnabled === "boolean") {
+            captureEnabled = migratedStore.preferences.captureEnabled;
+            retentionHours = migratedStore.preferences.retentionHours;
+            officialWebsite = migratedStore.preferences.officialWebsite;
+          }
+
+          localStorage.removeItem(HISTORY_KEY);
+          localStorage.removeItem(CATEGORIES_KEY);
+          localStorage.removeItem(PREFERENCES_KEY);
         }
-      } catch {
-        // ignore clipboard poll errors
+        storeReady = true;
+      } catch (err) {
+        storeError = `History could not be loaded. Existing data was preserved: ${String(err)}`;
+        return;
       }
-    }, 2000);
 
-    /** @param {ClipboardEvent} e */
-    const handlePaste = (e) => {
-      const active = document.activeElement;
-      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
-      if (!e.clipboardData) return;
+      const savedLastData = localStorage.getItem(LAST_DATA_KEY);
+      if (savedLastData) lastData = savedLastData;
 
-      const items = e.clipboardData.items;
-      for (let i = 0; i < items.length; i++) {
-        if (items[i].type.includes('image')) {
-          const blob = items[i].getAsFile();
-          if (!blob) continue;
-          const reader = new FileReader();
-          reader.onload = async (event) => {
-            const result = event?.target?.result;
-            if (typeof result !== 'string') return;
-            const base64 = result.split(',')[1];
-            if (!base64) return;
+      const savedPwds = localStorage.getItem(PASSWORDS_KEY);
+      if (!vaultExists && savedPwds) {
+        try {
+          passwords = JSON.parse(savedPwds);
+        } catch {
+          passwords = [];
+        }
+      }
 
-            const content = `image|${base64}`;
-            const signature = clipboardSignature('image', content);
+      try {
+        const status = await invoke("shortcut_status");
+        shortcutValue = status.shortcut;
+      } catch {}
+      try { autostartEnabled = await invoke('autostart_status'); }
+      catch (error) { autostartError = String(error); }
+
+      updateAndSaveHistory(history);
+      void migrateLegacyImageItems();
+
+      let polling = false;
+      clipboardInterval = setInterval(async () => {
+        if (polling || clearDataBusy) return;
+        const now = Date.now();
+        const EXPIRATION_MS = retentionHours * 60 * 60 * 1000;
+        if (
+          history.some(
+            (item) =>
+              item.type === 'text' &&
+              !item.restored &&
+              !item.isPinned &&
+              (!item.category || item.category === DEFAULT_CATEGORY) &&
+              now - item.id > EXPIRATION_MS
+          )
+        ) {
+          updateAndSaveHistory(history);
+        }
+
+        if (!captureEnabled) return;
+        polling = true;
+        try {
+          const data = await invoke('get_clipboard_data');
+          captureError = '';
+          if (disposed || !captureEnabled || clearDataBusy) return;
+          if (data) {
+            const [type, content] = data;
+            const signature = clipboardSignature(type, content);
             if (signature !== lastData) {
-              let storedContent = content;
-              try {
-                storedContent = await persistImageContent(content);
-              } catch {
+              if (isAppCopying && type === 'image') {
+                lastData = signature;
+                isAppCopying = false;
+                updateAndSaveHistory(history);
                 return;
               }
+
+              let storedContent = content;
+              if (type === 'image') {
+                storedContent = await persistImageContent(content);
+              }
+
+              const defaultCat =
+                type === 'text' && activeCategory !== DEFAULT_CATEGORY ? activeCategory : DEFAULT_CATEGORY;
               const newItem = {
-                type: 'image',
+                type,
                 content: storedContent,
                 id: Date.now(),
-                timestamp: new Date().toLocaleString(),
-                category: DEFAULT_CATEGORY
-              };
-              lastData = signature;
-              updateAndSaveHistory([newItem, ...history]);
-              triggerToast('Image Pasted!');
-            }
-          };
-          reader.readAsDataURL(blob);
-        } else if (items[i].type === 'text/plain') {
-          /** @param {string} text */
-          items[i].getAsString((text) => {
-            const signature = clipboardSignature('text', text);
-            if (signature !== lastData) {
-              const defaultCat = activeCategory !== DEFAULT_CATEGORY ? activeCategory : DEFAULT_CATEGORY;
-              const newItem = {
-                type: 'text',
-                content: text,
-                id: Date.now(),
-                timestamp: new Date().toLocaleString(),
+                timestamp: new Date().toISOString(),
                 category: defaultCat
               };
+
               lastData = signature;
               updateAndSaveHistory([newItem, ...history]);
-              triggerToast('Text Pasted!');
             }
-          });
+          }
+        } catch (error) {
+          captureError = `Clipboard could not be read: ${String(error)}`;
+        } finally { polling = false; }
+      }, 2000);
+
+      vaultLockInterval = setInterval(() => {
+        if (vaultUnlocked && Date.now() - vaultLastActivity >= VAULT_AUTO_LOCK_MS) {
+          void lockVault();
         }
-      }
+      }, 30_000);
+
+      /** @param {ClipboardEvent} e */
+      handlePaste = (e) => {
+        if (!captureEnabled) return;
+        const active = document.activeElement;
+        if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+        if (!e.clipboardData) return;
+
+        const items = e.clipboardData.items;
+        for (let i = 0; i < items.length; i++) {
+          if (items[i].type.includes('image')) {
+            const blob = items[i].getAsFile();
+            if (!blob) continue;
+            const reader = new FileReader();
+            reader.onload = async (event) => {
+              const result = event?.target?.result;
+              if (typeof result !== 'string') return;
+              const base64 = result.split(',')[1];
+              if (!base64) return;
+
+              const content = `image|${base64}`;
+              const signature = clipboardSignature('image', content);
+              if (signature !== lastData) {
+                let storedContent = content;
+                try {
+                  storedContent = await persistImageContent(content);
+                } catch {
+                  return;
+                }
+                const newItem = {
+                  type: 'image',
+                  content: storedContent,
+                  id: Date.now(),
+                  timestamp: new Date().toISOString(),
+                  category: DEFAULT_CATEGORY
+                };
+                lastData = signature;
+                updateAndSaveHistory([newItem, ...history]);
+                triggerToast('Image Pasted!');
+              }
+            };
+            reader.readAsDataURL(blob);
+          } else if (items[i].type === 'text/plain') {
+            /** @param {string} text */
+            items[i].getAsString((text) => {
+              const signature = clipboardSignature('text', text);
+              if (signature !== lastData) {
+                const defaultCat = activeCategory !== DEFAULT_CATEGORY ? activeCategory : DEFAULT_CATEGORY;
+                const newItem = {
+                  type: 'text',
+                  content: text,
+                  id: Date.now(),
+                  timestamp: new Date().toISOString(),
+                  category: defaultCat
+                };
+                lastData = signature;
+                updateAndSaveHistory([newItem, ...history]);
+                triggerToast('Text Pasted!');
+              }
+            });
+          }
+        }
+      };
+
+      window.addEventListener('paste', handlePaste);
     };
 
-    window.addEventListener('paste', handlePaste);
+    void init();
 
     return () => {
-      clearInterval(clipboardInterval);
-      window.removeEventListener('paste', handlePaste);
+      disposed = true;
+      if (clipboardInterval) clearInterval(clipboardInterval);
+      if (vaultLockInterval) clearInterval(vaultLockInterval);
+      if (handlePaste) window.removeEventListener('paste', handlePaste);
     };
   });
 
@@ -388,10 +836,12 @@
   /** @param {string} text */
   async function copyText(text) {
     if (!text) return;
+    try {
     await invoke('set_clipboard_text', { text });
     lastData = clipboardSignature('text', text);
     updateAndSaveHistory(history);
     triggerToast('Copied');
+    } catch (error) { triggerToast(`Copy failed: ${String(error)}`); }
   }
 
   /** @param {string} content */
@@ -423,12 +873,10 @@
       targetImage = null;
       closeImageMenu();
     }
+    if (selectedClipId === id) selectedClipId = null;
     if (item?.type === 'text' && item.content === lastData) {
       await invoke('set_clipboard_text', { text: '' });
       lastData = '';
-    }
-    if (item && item.type !== 'text') {
-      await cleanupImageFilesFromItems([item]);
     }
     updateAndSaveHistory(newHistory);
   }
@@ -443,7 +891,6 @@
       await invoke('set_clipboard_text', { text: '' });
       lastData = '';
     }
-    await cleanupImageFilesFromItems(removedImages);
     updateAndSaveHistory(newHistory);
   }
 
@@ -541,6 +988,7 @@
 
   /** @param {KeyboardEvent} event */
   function handleWindowKeydown(event) {
+    noteVaultActivity();
     if (event.key === 'Escape') {
       closeImageMenu();
       closeContextMenu();
@@ -587,7 +1035,7 @@
     closeContextMenu();
   }
 
-  function addPassword() {
+  async function addPassword() {
     if (!newPwdTitle.trim() || !newPwdPass.trim()) return;
     const newItem = {
       id: Date.now(),
@@ -596,19 +1044,57 @@
       password: newPwdPass,
       showPass: false
     };
+    const previous = passwords;
     passwords = [newItem, ...passwords];
-    savePasswords();
+    if (!await savePasswords()) { passwords = previous; return false; }
     newPwdTitle = '';
     newPwdUser = '';
     newPwdPass = '';
     showNewPwd = false;
     triggerToast('Saved');
+    return newItem.id;
+  }
+
+  /** @param {PasswordItem} item */
+  function startEditPassword(item) {
+    editingPasswordId = item.id;
+    editPwdTitle = item.title;
+    editPwdUser = item.username;
+    editPwdPass = item.password;
+  }
+
+  function cancelEditPassword() {
+    editingPasswordId = null;
+    editPwdTitle = '';
+    editPwdUser = '';
+    editPwdPass = '';
+  }
+
+  async function saveEditedPassword() {
+    if (editingPasswordId === null || !editPwdTitle.trim() || !editPwdPass.trim()) return;
+    const previous = passwords;
+    passwords = passwords.map((pwd) =>
+      pwd.id === editingPasswordId
+        ? {
+            ...pwd,
+            title: editPwdTitle.trim(),
+            username: editPwdUser.trim(),
+            password: editPwdPass
+          }
+        : pwd
+    );
+    if (!await savePasswords()) { passwords = previous; return false; }
+    cancelEditPassword();
+    triggerToast('Updated');
+    return true;
   }
 
   /** @param {number} id */
-  function deletePassword(id) {
+  async function deletePassword(id) {
+    if (!vaultUnlocked) return;
+    const previous = passwords;
     passwords = passwords.filter((pwd) => pwd.id !== id);
-    savePasswords();
+    if (!await savePasswords()) passwords = previous;
   }
 
   function clearAllPasswords() {
@@ -616,9 +1102,119 @@
     savePasswords();
   }
 
+  function exportPasswords() {
+    if (!vaultUnlocked) { activeTab = 'passwords'; triggerToast('Unlock the vault before exporting'); return; }
+    const data = {
+      format: PASSWORD_EXPORT_FORMAT,
+      version: PASSWORD_EXPORT_VERSION,
+      exportedAt: new Date().toISOString(),
+      passwords: passwords.map(({ title, username, password }) => ({ title, username, password }))
+    };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `my-clipboard-passwords-${data.exportedAt.slice(0, 10)}.json`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    triggerToast(`Exported ${passwords.length} password${passwords.length === 1 ? '' : 's'}`);
+  }
+
+  function requestPasswordImport() {
+    if (!vaultUnlocked) { activeTab = 'passwords'; triggerToast('Unlock the vault before importing'); return; }
+    passwordImportInput?.click();
+  }
+
+  /** @param {unknown} value */
+  function isPasswordRecord(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  }
+
+  /** @param {Event & { currentTarget: HTMLInputElement }} event */
+  async function importPasswords(event) {
+    if (!vaultUnlocked) return;
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (!file) return;
+    if (file.size > MAX_PASSWORD_IMPORT_BYTES) {
+      triggerToast('Import file is too large');
+      return;
+    }
+    try {
+      const parsed = JSON.parse(await file.text());
+      const entries = Array.isArray(parsed) ? parsed : parsed?.passwords;
+      if (
+        (!Array.isArray(parsed) &&
+          (parsed?.format !== PASSWORD_EXPORT_FORMAT || parsed?.version !== PASSWORD_EXPORT_VERSION)) ||
+        !Array.isArray(entries)
+      ) {
+        throw new Error('unsupported file');
+      }
+
+      const seen = new Set(passwords.map((item) => `${item.title}\u0000${item.username}\u0000${item.password}`));
+      const usedIds = new Set(passwords.map((item) => item.id));
+      let nextId = Date.now();
+      let skipped = 0;
+      /** @type {PasswordItem[]} */
+      const imported = [];
+
+      for (const entry of entries.slice(0, MAX_IMPORTED_PASSWORDS)) {
+        if (!isPasswordRecord(entry) || typeof entry.title !== 'string' || typeof entry.password !== 'string') {
+          skipped++;
+          continue;
+        }
+
+        const title = entry.title.trim();
+        const username = typeof entry.username === 'string' ? entry.username.trim() : '';
+        const password = entry.password;
+        const signature = `${title}\u0000${username}\u0000${password}`;
+        if (!title || !password || title.length > 500 || username.length > 500 || password.length > 2000 || seen.has(signature)) {
+          skipped++;
+          continue;
+        }
+
+        while (usedIds.has(nextId)) nextId++;
+        imported.push({ id: nextId++, title, username, password, showPass: false });
+        seen.add(signature);
+      }
+
+      skipped += Math.max(0, entries.length - MAX_IMPORTED_PASSWORDS);
+      if (imported.length === 0) {
+        triggerToast(skipped ? 'No new passwords imported' : 'No passwords found');
+        return;
+      }
+
+      const previous = passwords;
+      passwords = [...imported, ...passwords];
+      if (!await savePasswords()) { passwords = previous; return; }
+      cancelEditPassword();
+      triggerToast(`Imported ${imported.length}${skipped ? `, skipped ${skipped}` : ''}`);
+    } catch {
+      triggerToast('Invalid password export file');
+    }
+  }
+
   /** @param {number} id */
   function togglePassword(id) {
     passwords = passwords.map((pwd) => (pwd.id === id ? { ...pwd, showPass: !pwd.showPass } : pwd));
+  }
+
+  /** @param {number} id */
+  function selectClip(id) {
+    selectedClipId = id;
+  }
+
+  /** @param {number} id */
+  function togglePinnedClip(id) {
+    updateAndSaveHistory(history.map((item) => (item.id === id ? { ...item, isPinned: !item.isPinned } : item)));
+  }
+
+  async function copySelectedClipText() {
+    const selectedText = window.getSelection()?.toString().trim();
+    if (!selectedText) {
+      triggerToast('Select text to copy');
+      return;
+    }
+    await copyText(selectedText);
   }
 
   /** @param {string} content */
@@ -635,1012 +1231,126 @@
     }
   }
 
-  $: filteredImages = history.filter((item) => item.type !== 'text');
+  $: filteredImages = history
+    .filter((item) => item.type !== 'text')
+    .filter((item) => !searchQuery || `${item.timestamp} ${item.content.startsWith('file|') ? item.content.slice(5) : 'PNG image'}`.toLowerCase().includes(searchQuery.toLowerCase()));
   $: displayedText = history
-    .filter((item) => item.type === 'text')
     .filter((item) => activeCategory === DEFAULT_CATEGORY || (item.category || DEFAULT_CATEGORY) === activeCategory)
+    .filter((item) => recentFilter !== 'pinned' || item.isPinned)
     .filter((item) => !searchQuery || item.content.toLowerCase().includes(searchQuery.toLowerCase()));
+  $: selectedClip = displayedText.find((item) => item.id === selectedClipId) || displayedText[0] || null;
   $: filteredPasswords = pwdSearchQuery
-    ? passwords.filter((pwd) => pwd.title.toLowerCase().includes(pwdSearchQuery.toLowerCase()))
+    ? passwords.filter((pwd) =>
+        `${pwd.title} ${pwd.username}`.toLowerCase().includes(pwdSearchQuery.toLowerCase())
+      )
     : passwords;
+
+  /** @param {number | null} id @param {string} title @param {string} username @param {string} password */
+  async function saveReferencePassword(id, title, username, password) {
+    if (!vaultUnlocked) return;
+    if (id === null) {
+      newPwdTitle = title;
+      newPwdUser = username;
+      newPwdPass = password;
+      return await addPassword();
+    } else {
+      editingPasswordId = id;
+      editPwdTitle = title;
+      editPwdUser = username;
+      editPwdPass = password;
+      return await saveEditedPassword();
+    }
+  }
+
+  /** @param {string} name */
+  function addReferenceCollection(name) {
+    newCatName = name;
+    addCategory();
+  }
+
+  /** @param {string} name @param {string} next */
+  function renameCollection(name, next) {
+    targetCategory = name;
+    renameCatName = next;
+    confirmRename();
+  }
+
+  /** @param {string} name */
+  function removeCollection(name) {
+    targetCategory = name;
+    deleteCategoryFromMenu();
+  }
 </script>
 
 <svelte:window
   on:click={() => {
+    noteVaultActivity();
     closeContextMenu();
     closeImageMenu();
   }}
   on:keydown={handleWindowKeydown}
-  on:resize={syncTabIndicator}
 />
 
-<main class="app-shell">
-  <nav class="top-tabs">
-    <button
-      class="tab-btn {activeTab === 'clipboard' ? 'active' : ''}"
-      bind:this={clipboardTabEl}
-      on:click={() => (activeTab = 'clipboard')}
-    >
-      Clipboard
-    </button>
-    <button
-      class="tab-btn {activeTab === 'passwords' ? 'active' : ''}"
-      bind:this={passwordTabEl}
-      on:click={() => (activeTab = 'passwords')}
-    >
-      Password Book
-    </button>
-    <span
-      class="tab-indicator"
-      aria-hidden="true"
-      style="width: {tabLineW}px; transform: translateX({tabLineX}px);"
-    ></span>
-  </nav>
-
-  <div class="search-wrap">
-    <div class="search-bar">
-      <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <circle cx="11" cy="11" r="8" />
-        <line x1="21" y1="21" x2="16.65" y2="16.65" />
-      </svg>
-      {#if activeTab === 'clipboard'}
-        <input type="text" placeholder="Search stored clipboard..." bind:value={searchQuery} />
-      {:else}
-        <input type="text" placeholder="Search stored passwords..." bind:value={pwdSearchQuery} />
-      {/if}
-      <kbd>Ctrl K</kbd>
-    </div>
-  </div>
-
-  {#if activeTab === 'clipboard'}
-    <div class="workspace" in:fade={{ duration: 170 }}>
-      <section class="panel panel-image">
-        <header class="panel-head">
-          <h3>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="3" y="3" width="18" height="18" rx="3" />
-              <circle cx="8.6" cy="8.6" r="1.6" />
-              <polyline points="21 15 15.7 9.8 5 21" />
-            </svg>
-            Image History
-          </h3>
-          <button class="clear-btn" on:click={clearImages}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="3 6 5 6 21 6" />
-              <path d="M8 6v-2a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-            </svg>
-            Clear All
-          </button>
-        </header>
-
-        {#if filteredImages.length === 0}
-          <div class="empty-state" in:fade={{ duration: 260 }}>
-            <div class="empty-illustration">
-              <svg viewBox="0 0 100 100" fill="none">
-                <rect x="23" y="24" width="54" height="52" rx="11" stroke="#7fb4f3" stroke-width="3.4" />
-                <path d="M34 60l11-16 11 12 9-9 11 13" stroke="#6da5ea" stroke-width="4" stroke-linecap="round" />
-                <circle cx="63.5" cy="40.5" r="4.5" fill="#7fb4f3" />
-              </svg>
-            </div>
-            <p class="empty-title">No images yet</p>
-            <p class="empty-sub">Images you copy will appear here for quick access.</p>
-          </div>
-        {:else}
-          <div class="scroll-v image-grid">
-            {#each filteredImages as item (item.id)}
-              <div
-                class="image-card card-pop"
-                role="button"
-                tabindex="0"
-                on:click={() => copyImage(item.content)}
-                on:contextmenu|preventDefault={(e) => handleImageContextMenu(e, item)}
-                on:keydown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    copyImage(item.content);
-                  }
-                }}
-                in:fly={{ y: 12, duration: 260 }}
-              >
-                <img src={getImgSrc(item.content)} alt="clipboard" />
-                <span class="image-card-overlay">Copy</span>
-                <button class="icon-btn danger image-del" on:click|stopPropagation={() => deleteItem(item.id)} aria-label="Delete image">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                </button>
-              </div>
-            {/each}
-          </div>
-        {/if}
-      </section>
-
-      <section class="panel panel-text">
-        <header class="panel-head">
-          <h3>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="4" y1="6" x2="20" y2="6" />
-              <line x1="4" y1="12" x2="20" y2="12" />
-              <line x1="4" y1="18" x2="12" y2="18" />
-            </svg>
-            Text History
-          </h3>
-          <button class="clear-btn" on:click={clearText}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="3 6 5 6 21 6" />
-              <path d="M8 6v-2a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-            </svg>
-            Clear All
-          </button>
-        </header>
-
-        <div class="category-row">
-          <div class="category-scroll" on:wheel|preventDefault={handleCategoryWheel}>
-            {#each categories as cat}
-              {#if isRenamingCat && targetCategory === cat}
-                <input
-                  class="cat-editor"
-                  bind:value={renameCatName}
-                  on:keydown={(e) => {
-                    if (e.key === 'Enter') confirmRename();
-                    else if (e.key === 'Escape') isRenamingCat = false;
-                  }}
-                  on:blur={confirmRename}
-                />
-              {:else}
-                <button class="chip {activeCategory === cat ? 'active' : ''}" on:click={() => (activeCategory = cat)} on:contextmenu|preventDefault={(e) => handleContextMenu(e, cat)}>
-                  {cat}
-                </button>
-              {/if}
-            {/each}
-
-            {#if isAddingCat}
-              <input
-                class="cat-editor"
-                bind:value={newCatName}
-                on:keydown={(e) => {
-                  if (e.key === 'Enter') addCategory();
-                  else if (e.key === 'Escape') isAddingCat = false;
-                }}
-                on:blur={addCategory}
-                placeholder="新分类..."
-              />
-            {:else}
-              <button class="chip add-chip" on:click={() => (isAddingCat = true)} aria-label="Add category">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <line x1="12" y1="5" x2="12" y2="19" />
-                  <line x1="5" y1="12" x2="19" y2="12" />
-                </svg>
-              </button>
-            {/if}
-          </div>
-        </div>
-
-        <div class="scroll-v list-stack">
-          {#if displayedText.length === 0}
-            <div class="empty-list">No text records in this category.</div>
-          {/if}
-
-          {#each displayedText as item (item.id)}
-            <div
-              class="text-item card-pop"
-              role="button"
-              tabindex="0"
-              on:click={() => copyText(item.content)}
-              on:keydown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  copyText(item.content);
-                }
-              }}
-              in:fly={{ x: 14, duration: 260 }}
-            >
-              <div class="text-main">
-                <div class="text-title" title={item.content}>{item.content}</div>
-                <div class="text-meta">
-                  <select
-                    class="cat-select"
-                    value={item.category || DEFAULT_CATEGORY}
-                    on:change={(e) => changeCategory(item.id, e.currentTarget.value)}
-                    on:click|stopPropagation
-                  >
-                    {#each categories as cat}
-                      <option value={cat}>{cat}</option>
-                    {/each}
-                  </select>
-                </div>
-              </div>
-              <div class="text-actions">
-                <button class="icon-btn" on:click|stopPropagation={() => copyText(item.content)} aria-label="Copy text">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                  </svg>
-                </button>
-                <button class="icon-btn danger" on:click|stopPropagation={() => deleteItem(item.id)} aria-label="Delete text">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          {/each}
-        </div>
-      </section>
-    </div>
-  {:else}
-    <div class="workspace password-workspace" in:fade={{ duration: 170 }}>
-      <section class="panel panel-form">
-        <header class="panel-head single">
-          <h3>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="3" y="11" width="18" height="10" rx="2" />
-              <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-            </svg>
-            Add New
-          </h3>
-        </header>
-
-        <div class="form-body">
-          <label for="pwd-title">For what</label>
-          <div class="input-shell">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-              <polyline points="14 2 14 8 20 8" />
-              <line x1="16" y1="13" x2="8" y2="13" />
-            </svg>
-            <input id="pwd-title" bind:value={newPwdTitle} placeholder="Enter purpose or website" />
-          </div>
-
-          <label for="pwd-username">Username</label>
-          <div class="input-shell">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
-              <circle cx="12" cy="7" r="4" />
-            </svg>
-            <input id="pwd-username" bind:value={newPwdUser} placeholder="Enter username or email" />
-          </div>
-
-          <label for="pwd-password">Password</label>
-          <div class="input-shell">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M20 12V8a4 4 0 0 0-8 0v4" />
-              <rect x="4" y="12" width="16" height="9" rx="2" />
-            </svg>
-            <input id="pwd-password" bind:value={newPwdPass} placeholder="Enter password" type={showNewPwd ? 'text' : 'password'} />
-            <button class="inline-btn" on:click={() => (showNewPwd = !showNewPwd)} aria-label="Toggle password">
-              {#if showNewPwd}
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M17.94 17.94A10.94 10.94 0 0 1 12 20C5 20 1 12 1 12a18.4 18.4 0 0 1 5-6" />
-                  <path d="M9.9 4.2A9.1 9.1 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.2 3.2" />
-                  <line x1="1" y1="1" x2="23" y2="23" />
-                </svg>
-              {:else}
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                  <circle cx="12" cy="12" r="3" />
-                </svg>
-              {/if}
-            </button>
-          </div>
-
-          <button class="save-btn" on:click={addPassword}>Save</button>
-        </div>
-      </section>
-
-      <section class="panel panel-passwords">
-        <header class="panel-head">
-          <h3>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M15 7h3a5 5 0 0 1 0 10h-3" />
-              <path d="M9 17H6a5 5 0 1 1 0-10h3" />
-              <line x1="8" y1="12" x2="16" y2="12" />
-            </svg>
-            My Passwords
-          </h3>
-          <button class="clear-btn" on:click={clearAllPasswords}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="3 6 5 6 21 6" />
-              <path d="M8 6v-2a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-            </svg>
-            Clear All
-          </button>
-        </header>
-
-        <div class="scroll-v list-stack">
-          {#if filteredPasswords.length === 0}
-            <div class="empty-list">No password items yet.</div>
-          {/if}
-
-          {#each filteredPasswords as item (item.id)}
-            <div class="password-item card-pop" in:fly={{ x: 14, duration: 260 }}>
-              <div class="password-head">
-                <div class="password-title" title={item.title}>{item.title}</div>
-                <button class="icon-btn danger" on:click={() => deletePassword(item.id)} aria-label="Delete password">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                </button>
-              </div>
-
-              {#if item.username}
-                <div class="password-line">
-                  <span class="line-label">User:</span>
-                  <span class="line-value">{item.username}</span>
-                </div>
-              {/if}
-
-              <div class="password-line">
-                <span class="line-label">Pass:</span>
-                <span class="line-value">{item.showPass ? item.password : '••••'}</span>
-              </div>
-
-              <div class="password-actions">
-                <button class="icon-btn" on:click={() => togglePassword(item.id)} aria-label="Toggle password">
-                  {#if item.showPass}
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M17.94 17.94A10.94 10.94 0 0 1 12 20C5 20 1 12 1 12a18.4 18.4 0 0 1 5-6" />
-                      <path d="M9.9 4.2A9.1 9.1 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.2 3.2" />
-                      <line x1="1" y1="1" x2="23" y2="23" />
-                    </svg>
-                  {:else}
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                      <circle cx="12" cy="12" r="3" />
-                    </svg>
-                  {/if}
-                </button>
-                {#if item.username}
-                  <button class="icon-btn" on:click={() => copyText(item.username)} aria-label="Copy username">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
-                      <circle cx="12" cy="7" r="4" />
-                    </svg>
-                  </button>
-                {/if}
-                <button class="icon-btn" on:click={() => copyText(item.password)} aria-label="Copy password">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                  </svg>
-                </button>
-                <button class="icon-btn danger" on:click={() => deletePassword(item.id)} aria-label="Delete password">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="3 6 5 6 21 6" />
-                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          {/each}
-        </div>
-      </section>
-    </div>
-  {/if}
-
-  {#if showToast}
-    <div class="toast-tip" transition:scale={{ duration: 120 }}>{toastMsg}</div>
-  {/if}
-
-  {#if showContextMenu}
-    <div
-      class="context-menu"
-      style="left: {menuX}px; top: {menuY}px;"
-      role="menu"
-      tabindex="-1"
-      aria-label="Category menu"
-      in:fade={{ duration: 100 }}
-      on:mousedown|stopPropagation
-    >
-      <button class="menu-item" on:click={startRename}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M12 20h9" />
-          <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
-        </svg>
-        重命名
-      </button>
-      <div class="menu-divider"></div>
-      <button class="menu-item danger" on:click={deleteCategoryFromMenu}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="3 6 5 6 21 6" />
-          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-          <path d="M8 6v-2a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-        </svg>
-        删除分类
-      </button>
-    </div>
-  {/if}
-
-  {#if showImageMenu && targetImage}
-    <div
-      class="context-menu image-menu"
-      style="left: {imageMenuX}px; top: {imageMenuY}px;"
-      role="menu"
-      tabindex="-1"
-      aria-label="Image menu"
-      in:fade={{ duration: 100 }}
-      on:mousedown|stopPropagation
-    >
-      <button class="menu-item" on:click={() => openImagePreview()}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="7" />
-          <line x1="16.5" y1="16.5" x2="21" y2="21" />
-          <line x1="11" y1="8" x2="11" y2="14" />
-          <line x1="8" y1="11" x2="14" y2="11" />
-        </svg>
-        Preview
-      </button>
-    </div>
-  {/if}
-
-  {#if previewImage}
-    <div
-      class="preview-backdrop"
-      role="dialog"
-      tabindex="-1"
-      aria-modal="true"
-      aria-label="Image preview"
-      transition:fade={{ duration: 120 }}
-      on:mousedown={handlePreviewBackdropMouseDown}
-    >
-      <div class="preview-stage" role="document">
-        <div class="preview-toolbar">
-          <button class="preview-tool" on:click={() => zoomPreview(-0.2)} aria-label="Zoom out">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="11" cy="11" r="7" />
-              <line x1="8" y1="11" x2="14" y2="11" />
-              <line x1="16.5" y1="16.5" x2="21" y2="21" />
-            </svg>
-          </button>
-          <button class="preview-tool reset" on:click={() => (previewScale = 1)} aria-label="Reset zoom">
-            {Math.round(previewScale * 100)}%
-          </button>
-          <button class="preview-tool" on:click={() => zoomPreview(0.2)} aria-label="Zoom in">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="11" cy="11" r="7" />
-              <line x1="11" y1="8" x2="11" y2="14" />
-              <line x1="8" y1="11" x2="14" y2="11" />
-              <line x1="16.5" y1="16.5" x2="21" y2="21" />
-            </svg>
-          </button>
-          <button class="preview-tool" on:click={closeImagePreview} aria-label="Close preview">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
-          </button>
-        </div>
-        <div class="preview-scroll" on:wheel|preventDefault={handlePreviewWheel}>
-          <img
-            src={getImgSrc(previewImage.content)}
-            alt="Preview"
-            style="transform: scale({previewScale});"
-          />
-        </div>
-      </div>
-    </div>
-  {/if}
-</main>
-
-<style>
-  :global(body) {
-    margin: 0;
-    height: 100vh;
-    overflow: hidden;
-    font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-    background: linear-gradient(180deg, #f8fbff 0%, #f4f8ff 100%);
-    color: #16233f;
-  }
-
-  :global(*) { box-sizing: border-box; }
-  :global(button), :global(input), :global(select) { font-family: inherit; }
-
-  .app-shell {
-    width: 100%;
-    height: 100%;
-    padding: 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    animation: shell-reveal 0.34s ease-out;
-  }
-
-  .top-tabs {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    padding: 4px 4px 0;
-    border-bottom: 1px solid #dce6f4;
-    min-height: 38px;
-  }
-
-  .tab-btn {
-    border: none;
-    background: transparent;
-    color: #5b6d8c;
-    font-size: clamp(17px, 1.7vw, 20px);
-    padding: 8px 4px 10px;
-    line-height: 1;
-    cursor: pointer;
-    position: relative;
-    transition: color 0.22s ease;
-    font-weight: 500;
-    z-index: 1;
-  }
-
-  .tab-indicator {
-    position: absolute;
-    left: 0;
-    bottom: -1px;
-    height: 3px;
-    border-radius: 999px;
-    background: #2f84e6;
-    transition: transform 0.28s cubic-bezier(0.22, 1, 0.36, 1), width 0.28s cubic-bezier(0.22, 1, 0.36, 1);
-  }
-
-  .tab-btn.active { color: #14233f; font-weight: 700; }
-
-  .search-wrap { padding: 0 4px; }
-
-  .search-bar {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    border: 1px solid #d8e3f2;
-    background: #ffffff;
-    border-radius: 12px;
-    padding: 9px 11px;
-    box-shadow: 0 6px 16px rgba(120, 149, 191, 0.08);
-    transition: box-shadow 0.25s ease, border-color 0.25s ease, transform 0.25s ease;
-  }
-
-  .search-bar:focus-within {
-    border-color: #8abcf8;
-    box-shadow: 0 12px 24px rgba(82, 136, 213, 0.16);
-    transform: translateY(-1px);
-  }
-
-  .search-icon { width: 20px; height: 20px; color: #7b8baa; flex-shrink: 0; }
-
-  .search-bar input {
-    border: none;
-    outline: none;
-    background: transparent;
-    color: #2b3a56;
-    font-size: 14px;
-    flex: 1;
-  }
-
-  .search-bar input::placeholder { color: #8a99b7; }
-
-  kbd {
-    border: 1px solid #dae4f2;
-    background: #f6f9ff;
-    border-radius: 7px;
-    color: #8a97ae;
-    font-size: 12px;
-    padding: 4px 8px;
-    min-width: 48px;
-    text-align: center;
-    flex-shrink: 0;
-  }
-
-  .workspace {
-    flex: 1;
-    min-height: 0;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr);
-    gap: 10px;
-  }
-
-  .panel {
-    border: 1px solid #d8e3f2;
-    border-radius: 12px;
-    background: rgba(255, 255, 255, 0.9);
-    box-shadow: 0 8px 22px rgba(104, 136, 184, 0.08);
-    padding: 12px;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    animation: panel-in 0.36s ease;
-  }
-
-  .panel-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 12px;
-    gap: 10px;
-  }
-
-  .panel-head h3 {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 0;
-    font-size: clamp(17px, 1.8vw, 22px);
-    line-height: 1.1;
-    color: #1a2746;
-    font-weight: 700;
-  }
-
-  .panel-head h3 svg { width: 20px; height: 20px; color: #21314f; opacity: 0.92; }
-
-  .clear-btn {
-    border: 1px solid #bfe0ff;
-    background: #f2f8ff;
-    color: #2d81e4;
-    border-radius: 8px;
-    padding: 6px 10px;
-    font-size: 13px;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-    transition: all 0.22s ease;
-    white-space: nowrap;
-  }
-
-  .clear-btn svg { width: 14px; height: 14px; }
-  .clear-btn:hover { background: #e8f3ff; transform: translateY(-1px); box-shadow: 0 8px 18px rgba(72,136,213,.16); }
-
-  .empty-state {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-direction: column;
-    text-align: center;
-    gap: 8px;
-    color: #8b9ab5;
-    padding-bottom: 16px;
-  }
-
-  .empty-illustration {
-    width: 128px;
-    height: 128px;
-    border-radius: 50%;
-    background: radial-gradient(circle at 30% 30%, #e8f2ff, #f7fbff 68%);
-    display: grid;
-    place-items: center;
-    position: relative;
-    animation: float-y 4.6s ease-in-out infinite;
-  }
-
-  .empty-illustration::before, .empty-illustration::after {
-    content: '';
-    position: absolute;
-    width: 14px;
-    height: 14px;
-    background: radial-gradient(circle, #b2d2fb 5%, #e7f2ff 72%);
-    border-radius: 50%;
-    animation: twinkle 2.8s ease-in-out infinite;
-  }
-
-  .empty-illustration::before { top: 24px; right: 20px; }
-  .empty-illustration::after { bottom: 20px; left: 16px; animation-delay: .8s; }
-  .empty-illustration svg { width: 72px; height: 72px; filter: drop-shadow(0 10px 14px rgba(88,144,216,.2)); }
-
-  .empty-title { margin: 6px 0 0; font-size: 20px; color: #1d2946; font-weight: 700; line-height: 1.15; }
-  .empty-sub { margin: 0; max-width: 320px; font-size: 14px; color: #7f8da8; line-height: 1.45; }
-
-  .scroll-v {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    padding-right: 6px;
-  }
-
-  .scroll-v::-webkit-scrollbar { width: 6px; }
-  .scroll-v::-webkit-scrollbar-thumb { background: #c6d8f1; border-radius: 999px; }
-
-  .image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 10px; }
-
-  .image-card {
-    position: relative;
-    aspect-ratio: 1;
-    border: 1px solid #d6e4f4;
-    border-radius: 12px;
-    overflow: hidden;
-    padding: 0;
-    cursor: pointer;
-    background: #f6faff;
-    transition: transform .22s ease, box-shadow .22s ease, border-color .22s ease;
-  }
-
-  .image-card img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .image-card-overlay {
-    position: absolute;
-    inset: auto 0 0 0;
-    padding: 7px 10px;
-    color: #e7f3ff;
-    font-size: 14px;
-    text-align: center;
-    background: linear-gradient(180deg, transparent, rgba(21, 42, 75, 0.72));
-    opacity: 0;
-    transform: translateY(12px);
-    transition: all .24s ease;
-  }
-  .image-card:hover .image-card-overlay { opacity: 1; transform: translateY(0); }
-  .image-card:hover { transform: translateY(-2px); border-color: #93bff4; box-shadow: 0 14px 22px rgba(80, 128, 196, .22); }
-  .image-del { position: absolute; top: 6px; right: 6px; background: rgba(255, 255, 255, .92); }
-
-  .category-row { margin-bottom: 10px; }
-  .category-scroll { display: flex; align-items: center; gap: 10px; overflow-x: auto; overflow-y: hidden; padding-bottom: 2px; scroll-behavior: smooth; }
-  .category-scroll::-webkit-scrollbar { height: 4px; }
-  .category-scroll::-webkit-scrollbar-thumb { background: #d4e3f5; border-radius: 999px; }
-
-  .chip {
-    border: 1px solid #e2eaf6;
-    border-radius: 999px;
-    background: #f3f7fc;
-    color: #677897;
-    font-size: 13px;
-    padding: 6px 12px;
-    white-space: nowrap;
-    cursor: pointer;
-    transition: all .2s ease;
-    flex: 0 0 auto;
-  }
-  .chip:hover { transform: translateY(-1px); background: #edf4fe; color: #365986; }
-  .chip.active { border-color: transparent; color: #fff; background: linear-gradient(135deg, #2d83e6, #2d78d9); box-shadow: 0 8px 16px rgba(62,128,213,.3); }
-  .add-chip { width: 32px; height: 32px; min-width: 32px; min-height: 32px; padding: 0; border-radius: 50%; display: grid; place-items: center; flex: 0 0 auto; }
-  .add-chip svg { width: 14px; height: 14px; }
-
-  .cat-editor {
-    width: 96px;
-    min-width: 96px;
-    border: 1px solid #87b9f5;
-    border-radius: 999px;
-    padding: 6px 10px;
-    font-size: 13px;
-    background: #f8fbff;
-    outline: none;
-    color: #21324f;
-    flex: 0 0 auto;
-  }
-
-  .list-stack { display: flex; flex-direction: column; gap: 10px; }
-  .empty-list { border: 1px dashed #d4e2f3; border-radius: 12px; color: #8393ae; padding: 16px; text-align: center; background: #f9fbff; font-size: 13px; }
-
-  .card-pop { transition: transform .22s ease, box-shadow .22s ease, border-color .22s ease; }
-  .card-pop:hover { transform: translateY(-2px); box-shadow: 0 10px 22px rgba(82,130,199,.16); }
-
-  .text-item { border: 1px solid #d8e4f4; border-radius: 12px; padding: 11px 10px; background: #fff; display: flex; align-items: center; gap: 8px; cursor: pointer; }
-  .text-main { flex: 1; min-width: 0; }
-  .text-title { font-size: 15px; color: #1b2a48; font-weight: 700; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .text-meta { margin-top: 8px; }
-  .cat-select { border: 1px solid #cfe3fc; border-radius: 8px; background: #f2f8ff; color: #2f7dde; font-size: 13px; padding: 5px 24px 5px 10px; outline: none; cursor: pointer; max-width: 132px; }
-  .text-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-
-  .icon-btn {
-    width: 28px;
-    height: 28px;
-    border-radius: 7px;
-    border: 1px solid transparent;
-    background: transparent;
-    color: #6d7d9a;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    cursor: pointer;
-    transition: all .2s ease;
-  }
-  .icon-btn svg { width: 16px; height: 16px; }
-  .icon-btn:hover { color: #2a4f80; background: #eef4fd; border-color: #d6e4f6; }
-  .icon-btn.danger:hover { color: #d84f5f; background: #fff1f3; border-color: #ffd5dc; }
-
-  .panel-form { max-width: 440px; }
-  .form-body { display: flex; flex-direction: column; gap: 8px; margin-top: 2px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 2px; }
-  .form-body label { color: #3e4d68; font-size: 13px; margin-top: 2px; }
-
-  .input-shell {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    border: 1px solid #d6e4f5;
-    border-radius: 10px;
-    background: #fff;
-    padding: 8px 10px;
-    transition: all .22s ease;
-  }
-  .input-shell:focus-within { border-color: #8fbef7; box-shadow: 0 8px 18px rgba(72,136,213,.16); transform: translateY(-1px); }
-  .input-shell svg { width: 18px; height: 18px; color: #6f809f; flex-shrink: 0; }
-  .input-shell input { border: none; outline: none; background: transparent; color: #293957; font-size: 14px; flex: 1; }
-  .input-shell input::placeholder { color: #90a0ba; }
-
-  .inline-btn { width: 26px; height: 26px; border: none; background: transparent; color: #6d7e9e; border-radius: 8px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: all .2s ease; }
-  .inline-btn svg { width: 16px; height: 16px; }
-  .inline-btn:hover { color: #2c4f80; background: #eef4fd; }
-
-  .save-btn { margin-top: 12px; border: none; border-radius: 10px; padding: 10px 12px; color: #fff; font-weight: 700; font-size: 15px; background: linear-gradient(120deg, #2f87ea, #286ed8); cursor: pointer; transition: transform .22s ease, box-shadow .22s ease, filter .22s ease; }
-  .save-btn:hover { transform: translateY(-1px); filter: brightness(1.03); box-shadow: 0 12px 20px rgba(53,122,211,.28); }
-
-  .password-item { border: 1px solid #d8e4f4; border-radius: 12px; background: #fff; padding: 11px 12px; }
-  .password-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  .password-title { font-size: 16px; color: #1a2b49; font-weight: 700; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .password-line { margin-top: 8px; display: flex; align-items: baseline; gap: 8px; }
-  .line-label { color: #7a8ba8; min-width: 42px; font-size: 13px; }
-  .line-value { color: #2e3d5b; font-size: 14px; line-height: 1.35; word-break: break-all; }
-  .password-actions { margin-top: 10px; display: flex; justify-content: flex-end; gap: 6px; }
-
-  .toast-tip { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); background: #1f2f4d; color: #fff; font-size: 12px; padding: 7px 12px; border-radius: 999px; box-shadow: 0 12px 20px rgba(20,33,58,.28); z-index: 9999; }
-
-  .context-menu { position: fixed; min-width: 140px; border: 1px solid #d5e3f5; background: #fff; border-radius: 10px; box-shadow: 0 14px 26px rgba(80,118,173,.24); padding: 6px; z-index: 10000; }
-  .image-menu { min-width: 132px; }
-  .menu-item { width: 100%; border: none; background: transparent; border-radius: 8px; display: flex; align-items: center; gap: 8px; padding: 8px 10px; color: #4d607f; cursor: pointer; transition: all .2s ease; font-size: 14px; }
-  .menu-item svg { width: 16px; height: 16px; }
-  .menu-item:hover { background: #f0f6ff; color: #20426f; }
-  .menu-item.danger { color: #d05567; }
-  .menu-item.danger:hover { background: #fff1f3; color: #cc4256; }
-  .menu-divider { height: 1px; background: #e1eaf6; margin: 4px 0; }
-
-  .preview-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 10001;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 18px;
-    background: rgba(12, 21, 38, 0.72);
-  }
-
-  .preview-stage {
-    width: min(94vw, 1080px);
-    height: min(90vh, 760px);
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    min-width: 0;
-    min-height: 0;
-  }
-
-  .preview-toolbar {
-    align-self: center;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 7px;
-    border: 1px solid rgba(218, 229, 245, 0.34);
-    border-radius: 12px;
-    background: rgba(255, 255, 255, 0.96);
-    box-shadow: 0 14px 30px rgba(7, 16, 31, 0.28);
-  }
-
-  .preview-tool {
-    width: 34px;
-    height: 34px;
-    border: 1px solid #d8e5f5;
-    border-radius: 9px;
-    background: #f7fbff;
-    color: #37506f;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    cursor: pointer;
-    transition: all .18s ease;
-  }
-
-  .preview-tool svg { width: 17px; height: 17px; }
-  .preview-tool:hover { background: #eaf4ff; color: #1f5c9d; border-color: #b9d7f5; }
-
-  .preview-tool.reset {
-    width: 58px;
-    font-size: 12px;
-    font-weight: 700;
-    color: #233a59;
-  }
-
-  .preview-scroll {
-    flex: 1;
-    min-height: 0;
-    overflow: auto;
-    display: grid;
-    place-items: center;
-    border: 1px solid rgba(218, 229, 245, 0.22);
-    border-radius: 14px;
-    background:
-      linear-gradient(45deg, rgba(255,255,255,.13) 25%, transparent 25%),
-      linear-gradient(-45deg, rgba(255,255,255,.13) 25%, transparent 25%),
-      linear-gradient(45deg, transparent 75%, rgba(255,255,255,.13) 75%),
-      linear-gradient(-45deg, transparent 75%, rgba(255,255,255,.13) 75%),
-      rgba(15, 26, 46, 0.66);
-    background-size: 28px 28px;
-    background-position: 0 0, 0 14px, 14px -14px, -14px 0;
-  }
-
-  .preview-scroll img {
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
-    transform-origin: center center;
-    transition: transform .12s ease;
-    box-shadow: 0 18px 46px rgba(0, 0, 0, 0.32);
-    user-select: none;
-    -webkit-user-drag: none;
-  }
-
-  input::-ms-reveal,
-  input::-ms-clear,
-  input::-webkit-credentials-auto-fill-button { display: none !important; }
-
-  @keyframes shell-reveal { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-  @keyframes panel-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-  @keyframes float-y { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
-  @keyframes twinkle { 0%,100% { opacity: .4; transform: scale(1); } 50% { opacity: 1; transform: scale(1.2); } }
-
-  @media (max-width: 760px), (max-height: 700px) {
-    .app-shell {
-      padding: 10px;
-      gap: 8px;
-    }
-    .top-tabs {
-      gap: 10px;
-      padding-top: 2px;
-    }
-    .tab-btn {
-      font-size: 16px;
-      padding: 7px 2px 9px;
-    }
-    .panel {
-      padding: 10px;
-      border-radius: 10px;
-    }
-    .panel-head {
-      margin-bottom: 8px;
-    }
-    .panel-head h3 {
-      font-size: 16px;
-      gap: 7px;
-    }
-    .panel-head h3 svg {
-      width: 16px;
-      height: 16px;
-    }
-    .empty-illustration {
-      width: 98px;
-      height: 98px;
-    }
-    .empty-illustration svg {
-      width: 54px;
-      height: 54px;
-    }
-    .empty-title {
-      font-size: 16px;
-    }
-    .empty-sub {
-      font-size: 12px;
-      max-width: 240px;
-    }
-    .search-bar input {
-      font-size: 13px;
-    }
-    kbd {
-      font-size: 11px;
-      min-width: 42px;
-      padding: 3px 6px;
-    }
-    .workspace,
-    .password-workspace { gap: 8px; }
-    .text-title {
-      font-size: 14px;
-    }
-    .password-title {
-      font-size: 15px;
-    }
-    .line-value {
-      font-size: 13px;
-    }
-  }
-</style>
+<ClipboardApp
+  bind:activeTab
+  bind:searchQuery
+  bind:pwdSearchQuery
+  bind:activeCategory
+  bind:captureEnabled
+  bind:recentFilter
+  bind:masterPassword
+  bind:masterPasswordConfirm
+  bind:unlockPassword
+  bind:clearDataConfirmation
+  bind:shortcutValue
+  bind:retentionHours
+  {storeReady}
+  {storeError}
+  {captureError}
+  {settingsBusy}
+  {autostartEnabled}
+  {autostartError}
+  saveRetentionFn={saveRetention}
+  toggleAutostartFn={toggleAutostart}
+  {categories}
+  {vaultExists}
+  {vaultUnlocked}
+  {vaultBusy}
+  {vaultError}
+  {clearDataBusy}
+  {clearDataError}
+  {shortcutBusy}
+  {shortcutError}
+  {showToast}
+  {toastMsg}
+  {history}
+  {passwords}
+  {selectedClip}
+  {filteredImages}
+  {filteredPasswords}
+  copyTextFn={copyText}
+  copyImageFn={copyImage}
+  deleteItemFn={deleteItem}
+  clearImagesFn={clearImages}
+  lockVaultFn={lockVault}
+  requestPasswordImportFn={requestPasswordImport}
+  exportPasswordsFn={exportPasswords}
+  toggleCaptureFn={toggleCapture}
+  openOfficialWebsiteFn={openOfficialWebsite}
+  selectClipFn={selectClip}
+  togglePinnedClipFn={togglePinnedClip}
+  copySelectedClipTextFn={copySelectedClipText}
+  getImgSrcFn={getImgSrc}
+  setupVaultFn={setupVault}
+  unlockVaultFn={unlockVault}
+  savePasswordFn={saveReferencePassword}
+  deletePasswordFn={deletePassword}
+  addCollectionFn={addReferenceCollection}
+  renameCollectionFn={renameCollection}
+  removeCollectionFn={removeCollection}
+  changeCategoryFn={changeCategory}
+  clearDataFn={clearAllAppData}
+  updateShortcutFn={updateShortcut}
+/>
+
+<input hidden type="file" accept="application/json,.json" bind:this={passwordImportInput} on:change={importPasswords} />
