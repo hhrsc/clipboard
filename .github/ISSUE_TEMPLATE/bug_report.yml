@@ -1,0 +1,51 @@
+name: 问题反馈
+description: 安装、启动或使用 Clipboard 时遇到了问题
+title: "[问题] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: 感谢反馈。请勿粘贴密码、身份证号、令牌或真实剪贴板隐私内容。
+  - type: input
+    id: version
+    attributes:
+      label: Clipboard 版本
+      placeholder: 例如 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      placeholder: 例如 Windows 11 24H2
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请按顺序说明你做了什么，以及问题在第几步出现。
+      placeholder: |
+        1. 打开 Clipboard
+        2. ……
+        3. ……
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: 补充信息
+      description: 可提供已脱敏的截图或日志。上传前请再次检查隐私信息。
