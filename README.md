@@ -1,53 +1,82 @@
-# 📋 Clipboard Manager (剪贴板 & 密码本神器)
+<div align="center">
+  <img src="https://hhrsc.github.io/favicon.png" width="88" height="88" alt="Clipboard 图标" />
+  <h1>Clipboard</h1>
+  <p><strong>复制以后，依然找得到。</strong></p>
+  <p>一款本地优先的 Windows 剪贴板工具。保存文字与图片历史，自由选取需要的内容，再复制为纯文本、Markdown、HTML 或单行文本。</p>
 
-搞了个桌面端的小工具，平时复制粘贴东西、记点账号密码啥的挺方便的。主打一个轻量、好看、随叫随到。
+  <p>
+    <a href="https://hhrsc.github.io/website/">官网</a> ·
+    <a href="https://github.com/hhrsc/clipboard/releases/download/v0.1.0/my-clipboard_0.1.0_x64-setup.exe"><strong>下载 Windows 版</strong></a> ·
+    <a href="https://github.com/hhrsc/clipboard/releases/tag/v0.1.0">版本说明</a> ·
+    <a href="https://github.com/hhrsc/clipboard/issues/new/choose">问题与建议</a>
+  </p>
 
-受够了那些动辄占用几百 MB 内存的臃肿软件。UI 干净利落，后台安静潜伏，绝对是日常搬砖的效率好帮手。
+  <p>
+    <img alt="Windows 10 和 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-2d6f8e?logo=windows11&logoColor=white" />
+    <img alt="版本 0.1.0" src="https://img.shields.io/badge/version-0.1.0-bb5f43" />
+    <img alt="本地优先" src="https://img.shields.io/badge/data-local%20first-3d7055" />
+    <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-5c554d" />
+  </p>
+</div>
 
-## ✨ 核心功能能干啥？
+![Clipboard 的文字历史与详情界面](https://hhrsc.github.io/marketing/clipboard-recent.webp)
 
-* 🚀 **随叫随到 (全局快捷键)**
-  不管你在干嘛，按下 `Alt + C`（或你设置的快捷键），窗口瞬间弹到脸上。用完再按一次直接隐藏，绝不碍事。
-* 📝 **剪贴板历史 (图文分流)**
-  自动记录你最近复制的文字和图片。不管你是网页右键复制，还是用截图工具截的图，甚至是直接 `Ctrl+C` 复制的本地图片文件，都能完美抓取。左边图片、右边文字，点一下图标直接重新塞进剪贴板。
-* 🔑 **随身密码本 (本地存储)**
-  脑子不好使经常忘密码？直接存在这个密码本里。支持一键复制账号或密码，密码默认小眼睛隐藏防偷窥。数据全都存在你电脑本地，不连什么乱七八糟的云端，主打一个安全踏实。
-* 👻 **安静潜伏 (系统托盘 & 开机自启)**
-  开机自己默默启动，平时就躲在右下角系统托盘里当个透明人。想彻底退出？右键托盘图标点 Quit 就行。
+## 为什么做它
 
-## 🛠️ 怎么捣鼓出来的？
+Windows 的 `Win + V` 适合临时找回最近内容，但当记录变多，搜索、分类、图片管理和格式转换就会开始浪费时间。Clipboard 把这些操作集中在一个安静的桌面窗口里：打开、找到、复制，然后继续手上的事。
 
-用了目前桌面端极度舒适的技术栈，告别卡顿和内存焦虑：
-* **前端**: Svelte + Vite (无虚拟 DOM，快得飞起)
+## 现在能做什么
 
-* **后端**: Tauri + Rust (极速、极低内存占用、不吃电脑配置)
+- 保存文字、富文本和图片历史
+- 搜索、分类、置顶并设置普通文本保留时间
+- 在详情中自由选取真正需要的文字
+- 复制为纯文本、Markdown、HTML 或单行文本
+- 使用自定义全局快捷键快速打开
+- 在本机使用加密密码库整理常用账号信息
 
-* **剪贴板解析**: clipboard-rs (接管底层，什么姿势复制的图都能读出来)
+## 本地优先
 
-  ------
+当前版本不要求账户，没有云同步，也没有在应用内接入广告或行为分析。剪贴板历史与密码库保存在你的 Windows 设备上。
 
-  
+问题反馈是公开的，请勿在 Issue 中粘贴密码、令牌或真实剪贴板隐私内容。完整说明见[隐私政策](https://hhrsc.github.io/website/privacy-policy/)。
 
-如果你想把代码拉下来自己跑或者二次开发，按下面步骤来就行：
+## 下载
 
-装好 `Node.js` 和 `Rust` 环境。
+| 项目 | 信息 |
+| --- | --- |
+| 当前版本 | `0.1.0` |
+| 平台 | 64 位 Windows 10 / 11 |
+| 安装包大小 | 7.02 MB |
+| SHA-256 | `04C2B9E8B38B323FE09D73A207162AC440FCB6BA766FDA0F619A131C81C4D665` |
 
-- [ ] 依赖装一波：
+[从 GitHub Releases 下载](https://github.com/hhrsc/clipboard/releases/tag/v0.1.0)。独立开发者的新应用可能暂时触发 Windows SmartScreen 提醒，请只使用官网或本仓库的版本页，并核对上面的校验值。
 
-```bash
-npm install
+## 当前边界
+
+Clipboard 仍处于早期阶段，目前只提供 64 位 Windows 版本，也没有跨设备同步。功能和数据安全相关问题会优先处理；如果你愿意，请描述自己的真实工作流，而不只是给出一个功能名称。
+
+- [报告可以复现的问题](https://github.com/hhrsc/clipboard/issues/new?template=bug_report.yml)
+- [提交真实场景中的功能建议](https://github.com/hhrsc/clipboard/issues/new?template=feature_request.yml)
+- [观看 20 秒产品演示](https://github.com/hhrsc/clipboard/releases/download/v0.1.0/clipboard-promo-vertical-v1.mp4)
+
+## 开发
+
+技术栈：Tauri 2、Svelte 5 / SvelteKit、Rust。
+
+```powershell
+npm ci
+npm run check
+npm run tauri -- dev
 ```
 
-- [ ] 跑个开发环境玩玩：
+正式 Windows 构建：
 
-```
-npm run tauri dev
-```
-
-- [ ] 打包成 `.exe` 直接用：
-
-```
-npm run tauri build
+```powershell
+npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
 ```
 
-打包完的安装包在 `src-tauri/target/release/bundle/` 里面，直接双击安装，舒舒服服。
+浏览器预览不能代替 Tauri 原生功能验收。涉及密码库、重置或导入导出时，请使用隔离测试资料。
+
+## License
+
+[MIT](LICENSE)
