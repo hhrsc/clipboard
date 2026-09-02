@@ -25,6 +25,11 @@
 
 Windows 的 `Win + V` 适合临时找回最近内容，但当记录变多，搜索、分类、图片管理和格式转换就会开始浪费时间。Clipboard 把这些操作集中在一个安静的桌面窗口里：打开、找到、复制，然后继续手上的事。
 
+## 使用指南
+
+- [Windows 剪贴板历史怎么用？Win + V 与 Clipboard 选择指南](https://hhrsc.github.io/website/guides/windows-clipboard-history/)
+- [如何把文字复制为 Markdown、HTML、纯文本或单行文本](https://hhrsc.github.io/website/guides/copy-text-as-markdown-html/)
+
 ## 现在能做什么
 
 - 保存文字、富文本和图片历史
