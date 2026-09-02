@@ -6,7 +6,7 @@
 
   <p>
     <a href="https://hhrsc.github.io/website/">官网</a> ·
-    <a href="https://github.com/hhrsc/clipboard/releases/download/v0.1.0/my-clipboard_0.1.0_x64-setup.exe"><strong>下载 Windows 版</strong></a> ·
+    <a href="https://github.com/hhrsc/clipboard/releases/download/v0.1.0/Clipboard_0.1.0_x64-setup.exe"><strong>下载 Windows 版</strong></a> ·
     <a href="https://github.com/hhrsc/clipboard/releases/tag/v0.1.0">版本说明</a> ·
     <a href="https://github.com/hhrsc/clipboard/issues/new/choose">问题与建议</a>
   </p>
@@ -46,8 +46,8 @@ Windows 的 `Win + V` 适合临时找回最近内容，但当记录变多，搜�
 | --- | --- |
 | 当前版本 | `0.1.0` |
 | 平台 | 64 位 Windows 10 / 11 |
-| 安装包大小 | 7.02 MB |
-| SHA-256 | `04C2B9E8B38B323FE09D73A207162AC440FCB6BA766FDA0F619A131C81C4D665` |
+| 安装包大小 | 3.52 MB |
+| SHA-256 | `C5BE35E575E698696C376DF46247D4A670D0C8880098F5F2EAD5B7F921B8AE4C` |
 
 [从 GitHub Releases 下载](https://github.com/hhrsc/clipboard/releases/tag/v0.1.0)。独立开发者的新应用可能暂时触发 Windows SmartScreen 提醒，请只使用官网或本仓库的版本页，并核对上面的校验值。
 
