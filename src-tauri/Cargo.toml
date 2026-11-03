@@ -1,9 +1,12 @@
 [package]
 name = "my-clipboard"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "A local-first Windows clipboard manager."
+authors = ["hhrsc"]
 edition = "2021"
+homepage = "https://hhrsc.github.io/website/"
+repository = "https://github.com/hhrsc/clipboard"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -24,11 +27,19 @@ serde_json = "1.0"
 clipboard-rs = "0.2.1"
 base64 = "0.22.1"
 image = { version = "0.25.1", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
+aes-gcm = "0.10.3"
+argon2 = "0.5.3"
+rand = "0.8.5"
+zeroize = "1.8.2"
 tauri-plugin-global-shortcut = "2.0.0"
 tauri-plugin-autostart = "2.0.0"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"
+
+[target.'cfg(windows)'.dependencies]
+auto-launch = "0.5.0"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [profile.release]
 opt-level = 3

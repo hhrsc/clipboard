@@ -82,6 +82,10 @@ npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
 
 浏览器预览不能代替 Tauri 原生功能验收。涉及密码库、重置或导入导出时，请使用隔离测试资料。
 
+## 开发与阶段记录
+
+详细架构、开发步骤、验收边界及历史归档见 [Tag-V1 开发记录](docs/tag-v1-development.md)。该文档保留原阶段记录，其中的测试结果和构建哈希属于当时的快照。
+
 ## License
 
 [MIT](LICENSE)

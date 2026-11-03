@@ -1,0 +1,23 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Feature,Microsoft YaHei,52,&H00FFFFFF,&H00FFFFFF,&H001D1C1A,&HC01D1C1A,-1,0,0,0,100,100,0,0,3,1,0,2,220,220,72,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:04.50,Feature,,0,0,0,,复制一次，不该丢掉上一次。
+Dialogue: 0,0:00:04.50,0:00:08.00,Feature,,0,0,0,,Clipboard 把常用内容留在本机。
+Dialogue: 0,0:00:08.00,0:00:14.00,Feature,,0,0,0,,官网公开版本、系统要求与安装包校验值。
+Dialogue: 0,0:00:14.00,0:00:20.00,Feature,,0,0,0,,当前版本支持 64 位 Windows。
+Dialogue: 0,0:00:20.00,0:00:30.00,Feature,,0,0,0,,先搜索，再按分类找到需要的内容。
+Dialogue: 0,0:00:30.00,0:00:43.00,Feature,,0,0,0,,只选需要的句子，再复制为 Markdown。
+Dialogue: 0,0:00:43.00,0:00:55.52,Feature,,0,0,0,,文字和图片历史，可以随时切换。
+Dialogue: 0,0:00:55.52,0:01:08.00,Feature,,0,0,0,,密码库在本地加密保存。
+Dialogue: 0,0:01:08.00,0:01:22.00,Feature,,0,0,0,,当前版本不需要账户，也没有云同步。
+Dialogue: 0,0:01:22.00,0:01:30.00,Feature,,0,0,0,,从官网或 GitHub Releases 下载。
