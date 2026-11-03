@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_autostart::{Builder as AutostartBuilder, ManagerExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -43,6 +43,7 @@ const VAULT_ARGON_PARALLELISM: u32 = 1;
 const MAX_VAULT_PASSWORDS: usize = 1_000;
 const MAX_VAULT_BACKUP_BYTES: u64 = 8 * 1024 * 1024;
 const SHORTCUT_FILE_NAME: &str = "shortcut-preference.json";
+const AUTOSTART_FILE_NAME: &str = "autostart-preference.json";
 const DEFAULT_SHORTCUT: &str = "Alt+C";
 const CLIPBOARD_STORE_FILE_NAME: &str = "clipboard-store.json";
 const CLIPBOARD_STORE_VERSION: u32 = 1;
@@ -139,6 +140,12 @@ struct ShortcutPreference {
     shortcut: String,
 }
 
+#[derive(Deserialize, Serialize)]
+struct AutostartPreference {
+    version: u32,
+    enabled: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShortcutStatus {
@@ -198,7 +205,7 @@ impl Default for ClipboardPreferences {
         Self {
             capture_enabled: true,
             retention_hours: 24,
-            official_website: "https://www.gov.cn/".to_string(),
+            official_website: "https://hhrsc.github.io/website".to_string(),
         }
     }
 }
@@ -397,6 +404,64 @@ fn shortcut_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join(SHORTCUT_FILE_NAME))
 }
+
+fn autostart_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join(AUTOSTART_FILE_NAME))
+}
+
+fn load_autostart_preference(app: &tauri::AppHandle) -> Option<bool> {
+    let path = autostart_path(app).ok()?;
+    let preference =
+        serde_json::from_slice::<AutostartPreference>(&std::fs::read(path).ok()?).ok()?;
+    (preference.version == 1).then_some(preference.enabled)
+}
+
+fn write_autostart_preference(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let path = autostart_path(app)?;
+    let bytes = serde_json::to_vec(&AutostartPreference {
+        version: 1,
+        enabled,
+    })
+    .map_err(|_| "could not save startup preference".to_string())?;
+    std::fs::write(path, bytes).map_err(|_| "could not save startup preference".to_string())
+}
+
+fn desired_autostart_enabled(
+    preference: Option<bool>,
+    existing_install: bool,
+    registered: bool,
+) -> bool {
+    preference.unwrap_or(if existing_install { registered } else { true })
+}
+
+fn initialize_autostart(app: &tauri::AppHandle) -> Result<(), String> {
+    let registered = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
+    let existing_install = clipboard_store_path(app)?.exists();
+    let enabled =
+        desired_autostart_enabled(load_autostart_preference(app), existing_install, registered);
+    if enabled {
+        // 重新写入注册项，确保应用升级或构建路径变化后仍指向当前 EXE。
+        app.autolaunch().enable().map_err(|e| e.to_string())?;
+    } else if registered {
+        app.autolaunch().disable().map_err(|e| e.to_string())?;
+    }
+    write_autostart_preference(app, enabled)
+}
+
+#[cfg(windows)]
+fn remove_legacy_autostart() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let legacy =
+        auto_launch::AutoLaunch::new("my-clipboard", &exe.to_string_lossy(), &[] as &[&str]);
+    let _ = legacy.disable();
+}
+
+#[cfg(not(windows))]
+fn remove_legacy_autostart() {}
 
 fn normalize_shortcut(raw: &str) -> Result<String, String> {
     let parts = raw
@@ -1416,9 +1481,14 @@ fn autostart_status(app: tauri::AppHandle) -> Result<bool, String> {
 #[tauri::command]
 fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
     mutate(&app, || {
-    if enabled { app.autolaunch().enable() } else { app.autolaunch().disable() }
-        .map_err(|e| e.to_string())?;
-    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+        if enabled {
+            app.autolaunch().enable().map_err(|e| e.to_string())?;
+        } else if app.autolaunch().is_enabled().map_err(|e| e.to_string())? {
+            app.autolaunch().disable().map_err(|e| e.to_string())?;
+        }
+        let actual = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
+        write_autostart_preference(&app, actual)?;
+        Ok(actual)
     })
 }
 
@@ -1447,7 +1517,10 @@ fn reset_app_data(app: tauri::AppHandle, confirmation: String) -> Result<Clipboa
     let marker = reset_marker_path(&app)?;
     std::fs::create_dir_all(marker.parent().ok_or("Invalid app data directory")?).map_err(|e| e.to_string())?;
     write_reset_stage(&marker, "clearing")?;
-    app.autolaunch().disable().map_err(|e| e.to_string())?;
+    if app.autolaunch().is_enabled().map_err(|e| e.to_string())? {
+        app.autolaunch().disable().map_err(|e| e.to_string())?;
+    }
+    write_autostart_preference(&app, false)?;
     {
         let mut active = shortcut.shortcut.lock().map_err(|_| "shortcut settings are unavailable".to_string())?;
         if *active != DEFAULT_SHORTCUT {
@@ -1510,13 +1583,15 @@ fn main() {
             if let Err(error) = fit_initial_window(app.handle()) {
                 eprintln!("Could not fit initial window to monitor: {error}");
             }
-            // ==========================================
-            // 1. 初始化并开启【开机自启动】
-            // ==========================================
-            app.handle().plugin(tauri_plugin_autostart::init(
-                MacosLauncher::LaunchAgent,
-                Some(vec![]),
-            ))?;
+            app.handle().plugin(
+                AutostartBuilder::new()
+                    .app_name("Clipboard")
+                    .build(),
+            )?;
+            if let Err(error) = initialize_autostart(app.handle()) {
+                eprintln!("Could not initialize launch at startup: {error}");
+            }
+            remove_legacy_autostart();
 
             let stored_shortcut = load_shortcut_preference(app.handle());
             {
@@ -1722,6 +1797,15 @@ mod tests {
         assert!(normalize_shortcut("Ctrl+Ctrl+V").is_err());
         assert!(normalize_shortcut("Shift+C").is_err());
         assert!(normalize_shortcut("Alt+F1").is_err());
+    }
+
+    #[test]
+    fn autostart_defaults_on_and_preserves_existing_choice() {
+        assert!(desired_autostart_enabled(None, false, false));
+        assert!(desired_autostart_enabled(None, true, true));
+        assert!(!desired_autostart_enabled(None, true, false));
+        assert!(desired_autostart_enabled(Some(true), true, false));
+        assert!(!desired_autostart_enabled(Some(false), false, true));
     }
 
     #[test]

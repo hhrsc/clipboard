@@ -1,0 +1,40 @@
+name: 功能建议
+description: 描述一个真实工作流，以及 Clipboard 可以怎样帮到你
+title: "[建议] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: 比起功能名称，我们更想先理解你在哪个场景遇到了麻烦。
+  - type: textarea
+    id: workflow
+    attributes:
+      label: 你的使用场景
+      description: 你通常复制什么内容？当时想完成什么任务？
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 现在最不顺手的地方
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 你希望得到的结果
+      description: 不必设计具体按钮，只需描述理想结果。
+    validations:
+      required: true
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: 遇到频率
+      options:
+        - 每天多次
+        - 每天一次左右
+        - 每周几次
+        - 偶尔
+    validations:
+      required: true

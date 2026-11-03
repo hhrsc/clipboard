@@ -15,6 +15,10 @@
   const PASSWORD_EXPORT_VERSION = 2;
   const MAX_PASSWORD_IMPORT_BYTES = 1024 * 1024;
   const MAX_IMPORTED_PASSWORDS = 1000;
+  const OFFICIAL_WEBSITE = 'https://hhrsc.github.io/website';
+
+  /** @param {string} url */
+  const normalizeOfficialWebsite = (url) => url === 'https://www.gov.cn/' ? OFFICIAL_WEBSITE : url;
 
   /**
    * @typedef {Object} HistoryItem
@@ -48,7 +52,7 @@
   let lastData = '';
   let captureEnabled = true;
   let retentionHours = 24;
-  let officialWebsite = 'https://www.gov.cn/';
+  let officialWebsite = OFFICIAL_WEBSITE;
   let storeReady = false;
   let storeError = '';
   let captureError = '';
@@ -699,7 +703,7 @@
           if (loadedStore.preferences && typeof loadedStore.preferences.captureEnabled === "boolean") {
             captureEnabled = loadedStore.preferences.captureEnabled;
             retentionHours = loadedStore.preferences.retentionHours;
-            officialWebsite = loadedStore.preferences.officialWebsite;
+            officialWebsite = normalizeOfficialWebsite(loadedStore.preferences.officialWebsite);
           }
           const cached = localStorage.getItem(HISTORY_KEY);
           if (cached) {
@@ -722,7 +726,7 @@
           /** @type {Array<{type: string, content: string, id: number, timestamp: string, category: string, restored: boolean, isPinned: boolean}>} */
           let legacyRecords = [];
           let legacyCategories = [DEFAULT_CATEGORY];
-          let legacyPreferences = { captureEnabled: true, retentionHours: 24, officialWebsite: "https://www.gov.cn/" };
+          let legacyPreferences = { captureEnabled: true, retentionHours: 24, officialWebsite: OFFICIAL_WEBSITE };
 
           const savedHistory = localStorage.getItem(HISTORY_KEY);
           if (savedHistory) {
@@ -789,7 +793,7 @@
           if (migratedStore.preferences && typeof migratedStore.preferences.captureEnabled === "boolean") {
             captureEnabled = migratedStore.preferences.captureEnabled;
             retentionHours = migratedStore.preferences.retentionHours;
-            officialWebsite = migratedStore.preferences.officialWebsite;
+            officialWebsite = normalizeOfficialWebsite(migratedStore.preferences.officialWebsite);
           }
 
           localStorage.removeItem(HISTORY_KEY);
@@ -1504,6 +1508,10 @@
     deleteCategoryFromMenu();
   }
 </script>
+
+<svelte:head>
+  <title>Clipboard</title>
+</svelte:head>
 
 <svelte:window
   on:click={() => {

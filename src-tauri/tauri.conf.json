@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "my-clipboard",
+  "productName": "Clipboard",
   "version": "0.1.0",
   "identifier": "com.lenovo.my-clipboard",
   "build": {
@@ -36,6 +36,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "hhrsc",
+    "homepage": "https://hhrsc.github.io/website/",
+    "copyright": "Copyright © 2026 hhrsc",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

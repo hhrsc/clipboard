@@ -1,7 +1,10 @@
 <script>
   import { toMarkdown, toClipboardHtml } from '$lib/clipboard-format';
   import { responsivePopover } from '$lib/responsive-popover';
+  import { animate } from 'motion';
+  import { quintOut } from 'svelte/easing';
   import { onMount, tick } from 'svelte';
+  import { fade, fly } from 'svelte/transition';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { isTauri } from '@tauri-apps/api/core';
   import { IconMarkdown } from '@tabler/icons-svelte';
@@ -218,6 +221,12 @@
   let imageCollectionId = null;
   let imageMenuTop = 0;
   let imageMenuLeft = 0;
+  /** @type {HTMLDialogElement | undefined} */
+  let imagePreviewDialog;
+  /** @type {{id: number, src: string, content?: string, group?: string} | null} */
+  let previewImage = null;
+  /** @type {ReturnType<typeof animate> | null} */
+  let imagePreviewAnimation = null;
   let referenceShortcut = 'Ctrl+Shift+V';
   let savingPassword = false;
   let clipMenu = false;
@@ -426,6 +435,38 @@
   function chooseImage(item) {
     if (selectedImageId !== item.id) imageDimensions = imageSize = '';
     selectedImageId = item.id;
+  }
+
+  /** @param {{id: number, src: string, content?: string, group?: string}} item */
+  async function openImagePreview(item) {
+    chooseImage(item);
+    if (failedImages.has(item.src)) return;
+    previewImage = item;
+    await tick();
+    if (!imagePreviewDialog?.open) imagePreviewDialog?.showModal();
+    if (!imagePreviewDialog || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+    // 原生 dialog 不负责内容运动；短促缩放用于建立缩略图与预览层之间的空间关系。
+    imagePreviewAnimation?.stop();
+    imagePreviewAnimation = animate(
+      imagePreviewDialog,
+      { opacity: [0, 1], scale: [0.985, 1], y: [6, 0] },
+      { duration: 0.2, ease: [0.16, 1, 0.3, 1] }
+    );
+  }
+
+  async function closeImagePreview() {
+    if (!imagePreviewDialog?.open) return;
+    if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      imagePreviewAnimation?.stop();
+      imagePreviewAnimation = animate(
+        imagePreviewDialog,
+        { opacity: [1, 0], scale: [1, 0.99], y: [0, 4] },
+        { duration: 0.14, ease: [0.4, 0, 1, 1] }
+      );
+      await imagePreviewAnimation;
+    }
+    if (imagePreviewDialog.open) imagePreviewDialog.close();
   }
 
   /** @param {{id: number, src: string}} item @param {MouseEvent} event */
@@ -653,7 +694,7 @@
 <div class="ref-window" class:reference-mode={referenceMode}>
   <div class="compact-titlebar" data-tauri-drag-region></div>
   <button bind:this={navigationToggle} class="navigation-toggle" aria-label={sidebarOpen ? 'Close navigation' : 'Open navigation'} aria-expanded={sidebarOpen} aria-controls="app-sidebar" on:click={() => { closePopovers(); if (sidebarOpen) closeNavigation(); else sidebarOpen = true; }}>{#if sidebarOpen}<IconX size={22} strokeWidth={1.45} />{:else}<IconMenu size={22} strokeWidth={1.45} />{/if}</button>
-  {#if sidebarOpen}<button class="drawer-shade" aria-label="Close navigation backdrop" tabindex="-1" on:click={closeNavigation}></button>{/if}
+  {#if sidebarOpen}<button class="drawer-shade" aria-label="Close navigation backdrop" tabindex="-1" on:click={closeNavigation} transition:fade={{ duration: 160 }}></button>{/if}
   <aside id="app-sidebar" class="ref-sidebar" class:sidebar-open={sidebarOpen} inert={clearDataBusy || resetPending || (narrowWindow && !sidebarOpen)}>
     <div class="ref-brand" data-tauri-drag-region>Clipboard</div>
 
@@ -688,7 +729,7 @@
       {/if}
     </nav>
 
-    {#if collectionContext}<div class="popover collection-context" style:top={`${collectionContextY}px`}><button on:click={() => { editingCollection = collectionContext; collectionName = activeCollections.find(item => item.id === collectionContext)?.label || collectionContext; dialogError = ''; addingCollection = true; }}>Rename collection</button><button on:click={() => { if (activeTab === 'passwords') { confirmationCollection = collectionContext; confirmation = 'collection'; dialogError = ''; } else removeCollectionFn(collectionContext); }}>Delete collection</button></div>{/if}
+    {#if collectionContext}<div class="popover collection-context" style:top={`${collectionContextY}px`} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}><button on:click={() => { editingCollection = collectionContext; collectionName = activeCollections.find(item => item.id === collectionContext)?.label || collectionContext; dialogError = ''; addingCollection = true; }}>Rename collection</button><button on:click={() => { if (activeTab === 'passwords') { confirmationCollection = collectionContext; confirmation = 'collection'; dialogError = ''; } else removeCollectionFn(collectionContext); }}>Delete collection</button></div>{/if}
 
     {#if activeTab === 'passwords'}
       <button class="sidebar-lock" title={vaultRequirePassword ? 'Lock vault' : 'Enable password requirement in Settings to lock the vault'} disabled={!referenceMode && (!vaultRequirePassword || !vaultUnlocked || vaultBusy)} on:click={() => !referenceMode && lockVaultFn()}><IconLock size={22} strokeWidth={1.45} />Lock vault</button>
@@ -720,10 +761,10 @@
   {/if}
 
   {#if activeTab === 'recent'}
-    <main class="ref-main recent-page" inert={sidebarOpen}>
+    <main class="ref-main recent-page" inert={sidebarOpen} in:fade={{ duration: 160 }}>
       <section class="clip-column">
         <header class="column-title"><h2>Characters</h2><button class="filter-button" aria-label="Filter clips" on:click={() => (filterMenu = !filterMenu)}><IconFilter2 size={19} strokeWidth={1.45} /></button></header>
-        {#if filterMenu}<div class="popover clip-filter" use:responsivePopover={'.filter-button'}><button on:click={() => { recentFilter = 'all'; filterMenu = false; }}>All clips</button><button on:click={() => { recentFilter = 'pinned'; filterMenu = false; }}>Pinned clips</button></div>{/if}
+        {#if filterMenu}<div class="popover clip-filter" use:responsivePopover={'.filter-button'} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}><button on:click={() => { recentFilter = 'all'; filterMenu = false; }}>All clips</button><button on:click={() => { recentFilter = 'pinned'; filterMenu = false; }}>Pinned clips</button></div>{/if}
         <div class="clip-scroll">
           {#each clipRows as item, index}
             <button class="clip-row" class:selected={detailClip?.id === item.id} on:click={() => chooseClip(item)} on:dblclick={() => item.type === 'image' ? copyImageFn(item.content) : copyPlainText(item.content)}>
@@ -750,12 +791,12 @@
         </header>
 
         {#if detailClip}
-          {#if clipMenu}<div class="popover clip-actions-menu" use:responsivePopover={'.clip-detail .icon-actions button:last-child'}><button on:click={pinClip}>{detailClip.isPinned ? 'Unpin clip' : 'Pin clip'}</button><button on:click={removeClip}>Delete clip</button></div>{/if}
+          {#if clipMenu}<div class="popover clip-actions-menu" use:responsivePopover={'.clip-detail .icon-actions button:last-child'} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}><button on:click={pinClip}>{detailClip.isPinned ? 'Unpin clip' : 'Pin clip'}</button><button on:click={removeClip}>Delete clip</button></div>{/if}
           <h1 class="clip-heading">{clipLabel(detailClip)}</h1>
           <div class="clip-control-row">
             <label>Collection
               <button class="select-button" on:click={() => (collectionMenu = !collectionMenu)}><IconFolder size={19} strokeWidth={1.45} /><span>{referenceMode ? detailClip.category : detailClip.category === '全部' ? 'All clips' : detailClip.category || 'All clips'}</span><IconChevronDown size={16} strokeWidth={1.45} /></button>
-              {#if collectionMenu}<div class="popover collection-picker" use:responsivePopover={'.select-button'}>{#each activeCollections as collection}<button on:click={() => assignCollection(collection.label)}>{collection.label}</button>{/each}</div>{/if}
+              {#if collectionMenu}<div class="popover collection-picker" use:responsivePopover={'.select-button'} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}>{#each activeCollections as collection}<button on:click={() => assignCollection(collection.label)}>{collection.label}</button>{/each}</div>{/if}
             </label>
             <div class="copy-stack">
               <button class="primary-btn" on:click={copyClip}><IconCopy size={19} strokeWidth={1.45} />Copy all</button>
@@ -774,7 +815,7 @@
             <button on:click={() => copyFormatted('html')}><IconHtml size={18} strokeWidth={1.45} />Copy as HTML</button>
             <button on:click={() => copyFormatted('single-line')}><IconPilcrow size={18} strokeWidth={1.45} />Copy without line breaks</button>
             <button class="square-more" aria-label="More quick actions" on:click={() => (quickMenu = !quickMenu)}><IconDots size={20} strokeWidth={1.45} /></button>
-            {#if quickMenu}<div class="popover quick-menu" use:responsivePopover={'.square-more'}><button on:click={() => { copyClip(); quickMenu = false; }}>Copy plain text</button></div>{/if}
+            {#if quickMenu}<div class="popover quick-menu" use:responsivePopover={'.square-more'} in:fly={{ y: 4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}><button on:click={() => { copyClip(); quickMenu = false; }}>Copy plain text</button></div>{/if}
           </fieldset>
 
           <button class="danger-btn delete-clip" on:click={removeClip}><IconTrash size={19} strokeWidth={1.45} />Delete clip</button>
@@ -782,31 +823,31 @@
       </section>
     </main>
   {:else if activeTab === 'images'}
-    <main class="ref-main images-page" inert={sidebarOpen}>
+    <main class="ref-main images-page" inert={sidebarOpen} in:fade={{ duration: 160 }}>
       <section class="image-library">
         <h1 data-tauri-drag-region>Copied images</h1>
         <div class="image-tools">
           <label class="ref-search image-search"><IconSearch size={20} strokeWidth={1.45} /><input bind:value={searchQuery} placeholder="Search images" /></label>
           <button class="date-filter" on:click={() => (dateMenu = !dateMenu)}><IconCalendar size={20} strokeWidth={1.45} /><span>{dateFilter}</span><IconChevronDown size={16} strokeWidth={1.45} /></button>
-          {#if dateMenu}<div class="popover date-menu" use:responsivePopover={'.date-filter'}>{#each ['All time', 'Today', 'Yesterday'] as range}<button on:click={() => { dateFilter = range; dateMenu = false; }}>{range}</button>{/each}</div>{/if}
+          {#if dateMenu}<div class="popover date-menu" use:responsivePopover={'.date-filter'} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}>{#each ['All time', 'Today', 'Yesterday'] as range}<button on:click={() => { dateFilter = range; dateMenu = false; }}>{range}</button>{/each}</div>{/if}
         </div>
 
         <div class="image-scroll">
           {#if todayImages.length || referenceMode}<h2>Today</h2>{/if}
           <div class="image-grid">
             {#each todayImages as item}
-              <button class:selected={selectedImage?.id === item.id} title="Right-click to change collection" on:contextmenu|preventDefault={(event) => openImageCollection(item, event)} on:click={() => chooseImage(item)}>{#if failedImages.has(item.src)}<span class="image-failed">Image unavailable</span>{:else}<img src={item.src} alt="Clipboard item" on:error={() => failImage(item.src)} />{/if}</button>
+              <button class:selected={selectedImage?.id === item.id} title="Left-click to preview · Right-click to change collection" on:contextmenu|preventDefault={(event) => openImageCollection(item, event)} on:click={() => openImagePreview(item)}>{#if failedImages.has(item.src)}<span class="image-failed">Image unavailable</span>{:else}<img src={item.src} alt="Clipboard item" on:error={() => failImage(item.src)} />{/if}</button>
             {/each}
           </div>
           {#if yesterdayImages.length}
             <h2 class="yesterday-title">Yesterday</h2>
             <div class="image-grid yesterday-grid">
               {#each yesterdayImages as item}
-                <button class:selected={selectedImage?.id === item.id} title="Right-click to change collection" on:contextmenu|preventDefault={(event) => openImageCollection(item, event)} on:click={() => chooseImage(item)}>{#if failedImages.has(item.src)}<span class="image-failed">Image unavailable</span>{:else}<img src={item.src} alt="Clipboard item" on:error={() => failImage(item.src)} />{/if}</button>
+                <button class:selected={selectedImage?.id === item.id} title="Left-click to preview · Right-click to change collection" on:contextmenu|preventDefault={(event) => openImageCollection(item, event)} on:click={() => openImagePreview(item)}>{#if failedImages.has(item.src)}<span class="image-failed">Image unavailable</span>{:else}<img src={item.src} alt="Clipboard item" on:error={() => failImage(item.src)} />{/if}</button>
               {/each}
             </div>
           {/if}
-          {#if earlierImages.length}<h2 class="yesterday-title">Earlier</h2><div class="image-grid">{#each earlierImages as item}<button class:selected={selectedImage?.id === item.id} title="Right-click to change collection" on:contextmenu|preventDefault={(event) => openImageCollection(item, event)} on:click={() => chooseImage(item)}>{#if failedImages.has(item.src)}<span class="image-failed">Image unavailable</span>{:else}<img src={item.src} alt="Clipboard item" on:error={() => failImage(item.src)} />{/if}</button>{/each}</div>{/if}
+          {#if earlierImages.length}<h2 class="yesterday-title">Earlier</h2><div class="image-grid">{#each earlierImages as item}<button class:selected={selectedImage?.id === item.id} title="Left-click to preview · Right-click to change collection" on:contextmenu|preventDefault={(event) => openImageCollection(item, event)} on:click={() => openImagePreview(item)}>{#if failedImages.has(item.src)}<span class="image-failed">Image unavailable</span>{:else}<img src={item.src} alt="Clipboard item" on:error={() => failImage(item.src)} />{/if}</button>{/each}</div>{/if}
           {#if !imageRows.length}<p class="empty-state">{searchQuery || dateFilter !== 'All time' ? 'No matching images' : 'No copied images yet.'}</p>{/if}
         </div>
       </section>
@@ -830,7 +871,7 @@
     </main>
   {:else if activeTab === 'passwords'}
     {#if !referenceMode && !vaultUnlocked}
-      <main class="ref-main passwords-page vault-gate" inert={sidebarOpen}>
+      <main class="ref-main passwords-page vault-gate" inert={sidebarOpen} in:fade={{ duration: 160 }}>
         <form on:submit|preventDefault={vaultExists ? unlockVaultFn : setupVaultFn}>
           <h1>{vaultExists ? 'Unlock password vault' : 'Create password vault'}</h1>
           {#if vaultExists}
@@ -844,10 +885,10 @@
         </form>
       </main>
     {:else}
-    <main class="ref-main passwords-page" inert={sidebarOpen}>
+    <main class="ref-main passwords-page" inert={sidebarOpen} in:fade={{ duration: 160 }}>
       <section class="password-list">
         <header class="password-list-head"><h2>Password vault</h2><button class="primary-btn add-password" disabled={vaultSaving || vaultBusy} on:click={beginPassword}>Add password</button><button class="password-filter-button" aria-label="Filter passwords" data-menu-trigger on:click={() => (passwordFilterMenu = !passwordFilterMenu)}><IconFilter2 size={19} strokeWidth={1.45} /></button></header>
-        {#if passwordFilterMenu}<div class="popover password-filter-menu" use:responsivePopover={'.password-filter-button'}>
+        {#if passwordFilterMenu}<div class="popover password-filter-menu" use:responsivePopover={'.password-filter-button'} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}>
           {#each [{value:'all', label:'All items'}, {value:'with-username', label:'With username'}, {value:'without-username', label:'Without username'}] as option}<button aria-pressed={passwordFilter === option.value} on:click={() => { passwordFilter = option.value; passwordFilterMenu = false; }}>{option.label}</button>{/each}
           <hr />
           {#each [{value:'newest', label:'Newest first'}, {value:'oldest', label:'Oldest first'}, {value:'title', label:'Title A–Z'}] as option}<button aria-pressed={passwordSort === option.value} on:click={() => { passwordSort = option.value; passwordFilterMenu = false; }}>{option.label}</button>{/each}
@@ -872,7 +913,7 @@
           <h2>Item details</h2>
           <div class="icon-actions"><button aria-label="Edit" on:click={() => titleInput?.focus()}><IconPencil size={21} strokeWidth={1.45} /></button><button aria-label="More" disabled={!selectedPassword || addingPassword || vaultSaving || vaultBusy} data-menu-trigger on:click={() => { passwordMenu = !passwordMenu; choosingPasswordCollection = false; rowMenuId = null; }}><IconDots size={22} strokeWidth={1.45} /></button></div>
         </header>
-        {#if passwordMenu && selectedPassword}<div class="popover password-menu" use:responsivePopover={'.password-detail .icon-actions button:last-child'}>
+        {#if passwordMenu && selectedPassword}<div class="popover password-menu" use:responsivePopover={'.password-detail .icon-actions button:last-child'} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}>
           {#if choosingPasswordCollection}<button on:click={() => assignPasswordCollection(selectedPassword.id, null)}>No collection</button>{#each vaultCollections as collection}<button on:click={() => assignPasswordCollection(selectedPassword.id, collection.id)}>{collection.name}</button>{/each}
           {:else}<button on:click={() => { titleInput?.focus(); passwordMenu = false; }}>Edit password</button><button on:click={() => { copyPlainText(selectedPassword.username); passwordMenu = false; }}>Copy username</button><button on:click={() => { copyPlainText(selectedPassword.password); passwordMenu = false; }}>Copy password</button><button on:click={() => (choosingPasswordCollection = true)}>Move to collection</button><button on:click={() => removePassword()}>Delete password</button>{/if}
         </div>{/if}
@@ -889,7 +930,7 @@
     </main>
     {/if}
   {:else}
-    <main class="ref-main settings-page" inert={sidebarOpen}>
+    <main class="ref-main settings-page" inert={sidebarOpen} in:fade={{ duration: 160 }}>
       <section class="settings-content">
         <h1>General settings</h1>
         <div class="settings-row">
@@ -900,7 +941,7 @@
           <div><h2>Global shortcut</h2><p>Press this shortcut to open Clipboard anywhere.</p></div>
           <button class="shortcut-control" disabled={shortcutBusy || clearDataBusy || resetPending} on:click={toggleShortcutEditor}>{#each shortcutKeys as key, index}{#if index}<span>+</span>{/if}<kbd>{key}</kbd>{/each}<IconChevronDown size={16} strokeWidth={1.45} /></button>
         </div>
-        {#if editingShortcut}<form class="popover shortcut-editor" use:responsivePopover={'.shortcut-control'} on:submit|preventDefault={applyShortcut}><label>Global shortcut<input bind:this={shortcutInput} value={shortcutDraft} readonly placeholder="Press a shortcut…" on:keydown={recordShortcut} disabled={shortcutBusy || clearDataBusy || resetPending} title="Press the keys together to record a shortcut. Esc cancels; Tab moves to Apply." /></label><button class="outline-btn" disabled={!shortcutHasKey || shortcutBusy || clearDataBusy || resetPending}>Apply</button>{#if shortcutError}<p role="alert">{shortcutError}</p>{/if}</form>{/if}
+        {#if editingShortcut}<form class="popover shortcut-editor" use:responsivePopover={'.shortcut-control'} on:submit|preventDefault={applyShortcut} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}><label>Global shortcut<input bind:this={shortcutInput} value={shortcutDraft} readonly placeholder="Press a shortcut…" on:keydown={recordShortcut} disabled={shortcutBusy || clearDataBusy || resetPending} title="Press the keys together to record a shortcut. Esc cancels; Tab moves to Apply." /></label><button class="outline-btn" disabled={!shortcutHasKey || shortcutBusy || clearDataBusy || resetPending}>Apply</button>{#if shortcutError}<p role="alert">{shortcutError}</p>{/if}</form>{/if}
         {#if !referenceMode}<div class="settings-row vault-access-setting">
           <div><h2>Password vault access</h2><p>{!vaultStatusReady ? 'Checking vault availability…' : !vaultExists ? 'Create a password vault first to change this option.' : !vaultAutoUnlockAvailable ? 'Password-free access is only available on Windows.' : vaultRequirePassword ? 'Require a master password to open your password vault.' : 'Open without a password on this Windows account.'}</p></div>
           <div class="capture-control"><button class="toggle" class:active={vaultRequirePassword} aria-label="Require password to open password vault" aria-pressed={vaultRequirePassword} disabled={!vaultStatusReady || !vaultExists || !vaultAutoUnlockAvailable || vaultBusy || vaultSaving || clearDataBusy || resetPending} on:click={openVaultAccessDialog}><span></span></button><span>{vaultRequirePassword ? 'On' : 'Off'}</span></div>
@@ -923,24 +964,30 @@
       </section>
     </main>
   {/if}
-  {#if imageCollectionId !== null}<div class="popover image-collection-menu" aria-label="Image collection" style:top={`${imageMenuTop}px`} style:left={`${imageMenuLeft}px`}>
+  {#if imageCollectionId !== null}<div class="popover image-collection-menu" aria-label="Image collection" style:top={`${imageMenuTop}px`} style:left={`${imageMenuLeft}px`} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}>
     {#each activeCollections as collection}<button aria-pressed={(history.find(item => item.id === imageCollectionId)?.category || '全部') === (collection.id || '全部')} on:click={() => assignImageCollection(collection.id)}>{collection.label}</button>{/each}
   </div>{/if}
-  {#if menuPassword}<div class="popover password-row-menu" style:top={`${rowMenuTop}px`} style:left={`${rowMenuLeft}px`}>
+  {#if menuPassword}<div class="popover password-row-menu" style:top={`${rowMenuTop}px`} style:left={`${rowMenuLeft}px`} in:fly={{ y: -4, duration: 180, easing: quintOut }} out:fade={{ duration: 120 }}>
     {#if choosingPasswordCollection}<button disabled={vaultSaving} on:click={() => assignPasswordCollection(menuPassword.id, null)}>No collection</button>{#each vaultCollections as collection}<button disabled={vaultSaving} on:click={() => assignPasswordCollection(menuPassword.id, collection.id)}>{collection.name}</button>{/each}
     {:else}<button on:click={() => { loadedPasswordKey = ''; selectedPasswordId = menuPassword.id; addingPassword = false; revealPassword = false; rowMenuId = null; queueMicrotask(() => titleInput?.focus()); }}>Edit password</button><button on:click={() => { copyPlainText(menuPassword.username); rowMenuId = null; }}>Copy username</button><button on:click={() => { copyPlainText(menuPassword.password); rowMenuId = null; }}>Copy password</button><button on:click={() => (choosingPasswordCollection = true)}>Move to collection</button><button on:click={() => removePassword(menuPassword.id)}>Delete password</button>{/if}
   </div>{/if}
-  {#if addingCollection}<div class="dialog-backdrop"><form class="collection-dialog" on:submit|preventDefault={addCollection}><h2>{editingCollection ? 'Rename collection' : 'New collection'}</h2><input aria-label="Collection name" bind:value={collectionName} required />{#if dialogError}<p role="alert" class="interaction-error">{dialogError}</p>{/if}<div><button type="button" class="outline-btn" disabled={dialogBusy} on:click={() => { addingCollection = false; editingCollection = ''; }}>Cancel</button><button class="primary-btn" disabled={dialogBusy}>{dialogBusy ? 'Saving…' : editingCollection ? 'Save collection' : 'Create collection'}</button></div></form></div>{/if}
-  {#if vaultAccessDialog}<div class="dialog-backdrop" role="dialog" aria-modal="true" aria-label="Password vault access"><form class="collection-dialog vault-access-dialog" on:submit|preventDefault={saveVaultAccess}>
+  <dialog bind:this={imagePreviewDialog} class="image-lightbox" aria-label="Image preview" on:click={(event) => { if (event.target === imagePreviewDialog) closeImagePreview(); }} on:close={() => (previewImage = null)}>
+    {#if previewImage}
+      <button class="image-lightbox-close" aria-label="Close image preview" title="Close preview" on:click={closeImagePreview}><IconX size={24} strokeWidth={1.45} /></button>
+      <img src={referenceMode && previewImage.id === 1 ? '/reference-assets/images/selected.png' : previewImage.src} alt="Clipboard preview" />
+    {/if}
+  </dialog>
+  {#if addingCollection}<div class="dialog-backdrop" transition:fade={{ duration: 160 }}><form class="collection-dialog" on:submit|preventDefault={addCollection} in:fly={{ y: 6, duration: 200, easing: quintOut }}><h2>{editingCollection ? 'Rename collection' : 'New collection'}</h2><input aria-label="Collection name" bind:value={collectionName} required />{#if dialogError}<p role="alert" class="interaction-error">{dialogError}</p>{/if}<div><button type="button" class="outline-btn" disabled={dialogBusy} on:click={() => { addingCollection = false; editingCollection = ''; }}>Cancel</button><button class="primary-btn" disabled={dialogBusy}>{dialogBusy ? 'Saving…' : editingCollection ? 'Save collection' : 'Create collection'}</button></div></form></div>{/if}
+  {#if vaultAccessDialog}<div class="dialog-backdrop" role="dialog" aria-modal="true" aria-label="Password vault access" transition:fade={{ duration: 160 }}><form class="collection-dialog vault-access-dialog" on:submit|preventDefault={saveVaultAccess} in:fly={{ y: 6, duration: 200, easing: quintOut }}>
     <h2>{vaultAccessTarget ? 'Require a password?' : 'Open without a password?'}</h2>
     <p>{vaultAccessTarget ? 'Confirm your current master password. The vault will lock immediately and ask for this password when opened.' : 'Anyone using your signed-in Windows account will be able to open this vault. Data stays encrypted. Keep your master password for backups and recovery.'}</p>
     <input bind:this={vaultAccessInput} type="password" autocomplete="current-password" aria-label="Current master password" placeholder="Current master password" bind:value={vaultAccessPassword} disabled={vaultBusy} required />
     {#if vaultAccessError}<p class="interaction-error" role="alert">{vaultAccessError}</p>{/if}
     <div><button type="button" class="outline-btn" disabled={vaultBusy} on:click={closeVaultAccessDialog}>Cancel</button><button class="primary-btn" disabled={vaultBusy || !vaultAccessPassword}>{vaultBusy ? 'Saving…' : 'Confirm'}</button></div>
   </form></div>{/if}
-  {#if confirmation}<div class="dialog-backdrop"><div class="collection-dialog" role="dialog" aria-modal="true" aria-label={confirmation === 'images' ? 'Clear all images' : 'Delete collection'}><h2>{confirmation === 'images' ? 'Clear all images?' : 'Delete collection?'}</h2><p>{confirmation === 'images' ? 'This deletes all clipboard images, including images outside the current collection, search and date filter.' : 'Passwords will be kept in All items. Only this collection and its password associations will be removed.'}</p>{#if dialogError}<p class="interaction-error" role="alert">{dialogError}</p>{/if}<div><button class="outline-btn" disabled={dialogBusy} on:click={() => (confirmation = '')}>Cancel</button><button class="primary-btn" disabled={dialogBusy} on:click={confirmAction}>{dialogBusy ? 'Deleting…' : 'Delete'}</button></div></div></div>{/if}
-  {#if showToast && !referenceMode && !vaultAccessDialog}<div class="status-toast" role="status">{toastMsg}</div>{/if}
-  {#if !referenceMode && (storeError || captureError)}<div class="status-toast error-toast" role="alert">{storeError || captureError}</div>{/if}
+  {#if confirmation}<div class="dialog-backdrop" transition:fade={{ duration: 160 }}><div class="collection-dialog" role="dialog" aria-modal="true" aria-label={confirmation === 'images' ? 'Clear all images' : 'Delete collection'} in:fly={{ y: 6, duration: 200, easing: quintOut }}><h2>{confirmation === 'images' ? 'Clear all images?' : 'Delete collection?'}</h2><p>{confirmation === 'images' ? 'This deletes all clipboard images, including images outside the current collection, search and date filter.' : 'Passwords will be kept in All items. Only this collection and its password associations will be removed.'}</p>{#if dialogError}<p class="interaction-error" role="alert">{dialogError}</p>{/if}<div><button class="outline-btn" disabled={dialogBusy} on:click={() => (confirmation = '')}>Cancel</button><button class="primary-btn" disabled={dialogBusy} on:click={confirmAction}>{dialogBusy ? 'Deleting…' : 'Delete'}</button></div></div></div>{/if}
+  {#if showToast && !referenceMode && !vaultAccessDialog}<div class="status-toast" role="status" in:fly={{ y: 8, duration: 180, easing: quintOut }} out:fly={{ y: 5, duration: 130, easing: quintOut }}>{toastMsg}</div>{/if}
+  {#if !referenceMode && (storeError || captureError)}<div class="status-toast error-toast" role="alert" in:fly={{ y: 8, duration: 180, easing: quintOut }} out:fly={{ y: 5, duration: 130, easing: quintOut }}>{storeError || captureError}</div>{/if}
 </div>
 
 <style>
@@ -976,7 +1023,13 @@
     font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
   }
 
-  button { color: inherit; border: 0; background: transparent; cursor: default; }
+  button {
+    color: inherit;
+    border: 0;
+    background: transparent;
+    cursor: default;
+    transition: color 150ms ease, background-color 150ms ease, border-color 150ms ease, opacity 150ms ease;
+  }
   h1, h2, h3, p { margin: 0; }
 
   .ref-sidebar {
@@ -1291,9 +1344,9 @@
   .settings-row p { margin-top: 3px; color: var(--muted); font-size: 16px; line-height: 22px; }
   .capture-control { display: flex; align-items: center; gap: 14px; margin-right: 1px; font-family: var(--serif); font-size: 16px; }
   .toggle { width: 51px; height: 28px; padding: 3px; border-radius: 15px; background: #bbb5af; }
-  .toggle span { display: block; width: 22px; height: 22px; border-radius: 50%; background: #fff; }
+  .toggle span { display: block; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: transform 180ms cubic-bezier(.16, 1, .3, 1); }
   .toggle.active { background: var(--accent); }
-  .toggle.active span { margin-left: 23px; }
+  .toggle.active span { transform: translateX(23px); }
   .shortcut-control { width: 293px; height: 50px; padding: 0 15px; display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--line-strong); border-radius: 7px; font-size: 17px; }
   .shortcut-control kbd { min-width: 32px; height: 35px; padding: 0 10px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); font-family: "Segoe UI", Arial, sans-serif; font-size: 16px; font-weight: 400; }
   .shortcut-control kbd:first-of-type { min-width: 46px; }
@@ -1347,6 +1400,22 @@
   .image-empty-detail { margin-top: 97px; }
   .image-failed { display: grid; place-content: center; padding: 20px; height: 100%; color: var(--muted); border: 1px solid var(--line); font: 16px/24px var(--serif); }
   .image-preview.image-failed { height: 480px; }
+  .image-lightbox {
+    width: calc(100vw - 72px);
+    height: calc(100vh - 72px);
+    max-width: 1280px;
+    max-height: 880px;
+    padding: 38px;
+    border: 1px solid #595550;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #211f1d;
+  }
+  .image-lightbox[open] { display: grid; place-items: center; }
+  .image-lightbox::backdrop { background: rgba(41, 40, 36, .72); }
+  .image-lightbox > img { position: absolute; inset: 38px; display: block; width: calc(100% - 76px); height: calc(100% - 76px); object-fit: contain; }
+  .image-lightbox-close { position: absolute; top: 9px; right: 9px; width: 40px; height: 40px; display: grid; place-items: center; border-radius: 7px; color: #faf9f7; background: rgba(250, 249, 247, .1); }
+  .image-lightbox-close:hover { background: rgba(250, 249, 247, .18); }
   .thumb-failed { width: 56px; font-size: 10px; line-height: 15px; }
   .recent-image-preview { display: block; width: 100%; height: 100%; object-fit: contain; }
   .clip-actions-menu { right: 31px; top: 63px; }
@@ -1354,6 +1423,7 @@
   .quick-menu { bottom: 60px; right: 20px; }
   button:disabled { cursor: default; }
   button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .image-lightbox button:focus-visible { outline-color: #faf9f7; }
   .settings-page { overflow-y: auto; }
   .native-settings { margin: 24px 0 40px; padding: 20px 25px; border: 1px solid var(--line); border-radius: 7px; font-size: 16px; }
   .native-setting { display: flex; align-items: center; justify-content: space-between; margin: 20px 0; }
@@ -1469,8 +1539,24 @@
 
   @media (max-width: 1100px) {
     .ref-window { --sidebar-width: 0px; }
-    .ref-sidebar { display: none; }
-    .ref-sidebar.sidebar-open { display: flex; z-index: 35; width: min(306px, calc(100% - 58px)); padding-top: 52px; }
+    .ref-sidebar {
+      display: block;
+      z-index: 35;
+      width: min(306px, calc(100% - 58px));
+      padding-top: 52px;
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+      transform: translateX(-18px);
+      transition: opacity 160ms ease, transform 220ms cubic-bezier(.16, 1, .3, 1), visibility 0s linear 220ms;
+    }
+    .ref-sidebar.sidebar-open {
+      opacity: 1;
+      visibility: visible;
+      pointer-events: auto;
+      transform: translateX(0);
+      transition-delay: 0s;
+    }
     .navigation-toggle { position: absolute; display: grid; place-items: center; top: 8px; left: 16px; z-index: 36; width: 36px; height: 36px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); }
     .drawer-shade { display: block; position: absolute; inset: 0; z-index: 34; background: #29282433; }
     .compact-titlebar { display: block; position: absolute; top: 0; left: 0; right: 0; height: 46px; }
@@ -1537,5 +1623,17 @@
   @media (max-height: 500px) {
     .ref-sidebar { overflow-y: auto; }
     .ref-sidebar .ref-collection-list { flex: 0 0 auto; overflow: visible; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: .01ms !important;
+    }
+
+    .ref-sidebar {
+      transform: none;
+    }
   }
 </style>
